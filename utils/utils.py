@@ -2,7 +2,7 @@ import torch
 from typing import Union, Optional, Tuple
 import torch.nn.functional as F
 
-def compute_entropy(logits: torch.Tensor, action_mask: Optional[torch.Tensor] = None, temperature: float = 1.0) -> torch.Tensor:
+def compute_entropy(logprobs: torch.Tensor, action_mask: Optional[torch.Tensor] = None, temperature: float = 1.0) -> torch.Tensor:
     """
     Compute the entropy of the action distribution from logits.
     
@@ -35,20 +35,20 @@ def compute_entropy(logits: torch.Tensor, action_mask: Optional[torch.Tensor] = 
     
     # return entropy
 
-    if temperature != 1.0:
-        logits = logits / temperature
+    # if temperature != 1.0:
+    #     logits = logits / temperature
     
     # Compute log probabilities
-    log_probs = F.log_softmax(logits, dim=-1)
+    # log_probs = F.log_softmax(logits, dim=-1)
     # Compute probabilities
-    probs = F.softmax(logits, dim=-1)
+    probs = logprobs.exp()
     
     # Compute entropy: -sum(p * log(p))
-    entropy = -(probs * log_probs).sum(dim=-1)
+    entropy = -(probs * logprobs).sum(dim=-1)
     
     # Apply action mask if provided
     if action_mask is not None:
-        entropy = masked_mean(entropy, action_mask, dim=-1)
+        entropy = masked_mean(entropy, action_mask, axis=-1)
     else:
         entropy = entropy.mean(dim=-1)
     

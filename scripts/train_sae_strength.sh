@@ -10,32 +10,40 @@ tensor_parallel_size=1
 
 top_p=0.95
 temperature=0.6
-max_model_length=32768
+max_model_length=22048
 max_input_len=2048
-max_output_len=10000
+max_output_len=20000
 gpu_util=0.8
 lr=1e-4
 kl_coef=1e-4
+vocab_size=128256
+logprobs=20
 
-train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/math/train_with_idx.jsonl"
-test_data_path="/angel/fwk/code/PPO-PyTorch/dataset/math/train_with_idx.jsonl"
+train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/scp116k/train.jsonl"
+# train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/math/train_with_idx.jsonl"
+test_data_path="/angel/fwk/code/PPO-PyTorch/dataset/gpqa_diamond/test.jsonl"
+train_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
+test_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
 
 model="/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 sae_release=andreuka18/deepseek-r1-distill-llama-8b-lmsys-openthoughts
 sae_id=blocks.19.hook_resid_post
-save_path="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B.pth"
-
-num_epochs=1
-batch_size=1
+save_dir="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B"
+save_interval=50
+eval_interval=10
+num_epochs=2
+batch_size=4
 feature_idxs=13023,19510,21893,25591,33275,43427,50670,51021,54249,61353
-max_activations=5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0
+max_activations=20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0
 
 loss_agg_mode="token-mean"
-n_samples_per_prompt=2
+n_samples_per_prompt=16
 
 python train_sae_strength.py \
     --train_data_path $train_data_path \
     --test_data_path $test_data_path \
+    --train_prompt_path $train_prompt_path \
+    --test_prompt_path $test_prompt_path \
     --batch_size $batch_size \
     --model $model \
     --tensor_parallel_size $tensor_parallel_size \
@@ -57,5 +65,9 @@ python train_sae_strength.py \
     --loss_agg_mode $loss_agg_mode \
     --lr $lr \
     --num_epochs $num_epochs \
-    --save_path $save_path \
-    --kl_coef $kl_coef
+    --save_dir $save_dir \
+    --save_interval $save_interval \
+    --kl_coef $kl_coef \
+    --vocab_size $vocab_size \
+    --logprobs $logprobs \
+    --eval_interval $eval_interval

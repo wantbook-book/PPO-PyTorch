@@ -36,7 +36,7 @@ class VllmSampler:
         else:
             self.get_multi_intervention_hook_with_strengths = None
         
-    def generate(self, prompts: list[str], strengths_list: list[list[float]], samples_per_prompt: int):
+    def generate(self, prompts: list[str], strengths_list: list[list[float]], samples_per_prompt: int=1):
         outputs = []
         for prompt, strengths in zip(prompts, strengths_list):
             sae_hooks = []
@@ -46,74 +46,135 @@ class VllmSampler:
                 output = self.llm.generate(
                     [prompt]*samples_per_prompt,  # vLLM的generate方法期望接收一个列表，即使只有一个prompt
                     self.sampling_params,
+                    use_tqdm=False
                 )
             outputs.extend(output)  # 使用extend而不是append，因为output本身就是一个列表
         return outputs
 
-    def get_last_token_hidden_state(self, prompts: list[str])->torch.Tensor:
-        hidden_states = []
+    def get_last_token_hidden_state(self, prompts: list[str], batch_size: int=8)->torch.Tensor:
+        """
+        获取每个prompt最后一个token的hidden state
+        采用分批处理来避免OOM问题
         
+        Args:
+            prompts: 输入的prompt列表
+            batch_size: 每批处理的prompt数量，默认为8
+            
+        Returns:
+            hidden_states: [num_prompts, hidden_dim] 的tensor
+        """
+        hidden_states = []
         tokenizer = self.tokenizer
-        for i, prompt in enumerate(prompts):
-            # 对每个prompt进行tokenization
-            inputs = tokenizer(prompt, return_tensors="pt")
+        total_prompts = len(prompts)
+        
+        # 分批处理prompts
+        for i in range(0, total_prompts, batch_size):
+            end_idx = min(i + batch_size, total_prompts)
+            batch_prompts = prompts[i:end_idx]
+            
+            # 批量tokenization
+            inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
             input_ids = inputs["input_ids"].to(self.model.device)
             attention_mask = inputs["attention_mask"].to(self.model.device)
+            
+            # 创建position_ids
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             
             # 通过self.model前向传播获取hidden states
             with torch.no_grad():
-                model_outputs = self.model(input_ids, position_ids=position_ids, attention_mask=attention_mask, output_hidden_states=True)
-                # 获取最后一个token的hidden state
-                # hidden_states是一个tuple，最后一层的hidden state是最后一个元素
+                model_outputs = self.model(
+                    input_ids, 
+                    position_ids=position_ids, 
+                    attention_mask=attention_mask, 
+                    output_hidden_states=True
+                )
+                
+                # 获取最后一层的hidden states
                 last_layer_hidden_states = model_outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_dim]
-                last_hidden_state = last_layer_hidden_states[0, -1, :]  # [hidden_dim]
-                hidden_states.append(last_hidden_state)
-        # (N, d_h)
+                
+                # 对每个样本获取最后一个有效token的hidden state
+                batch_hidden_states = []
+                for j in range(last_layer_hidden_states.shape[0]):
+                    # 找到最后一个非padding token的位置
+                    seq_len = attention_mask[j].sum().item()
+                    last_hidden_state = last_layer_hidden_states[j, seq_len-1, :]  # [hidden_dim]
+                    batch_hidden_states.append(last_hidden_state.cpu())  # 移动到CPU
+                
+                hidden_states.extend(batch_hidden_states)
+                
+                # 显式删除大tensor以释放内存
+                del model_outputs, last_layer_hidden_states
+                torch.cuda.empty_cache()
+            
+            # 删除batch数据
+            del input_ids, attention_mask, position_ids
+        
+        # 合并所有批次的结果
         hidden_states = torch.stack(hidden_states)
         return hidden_states
     
-    def get_logprobs(self, sequences: torch.Tensor, attention_masks: torch.Tensor, temperature: float=1.0)->torch.Tensor:
+    def get_logprobs(self, sequences: torch.Tensor, attention_masks: torch.Tensor, temperature: float=1.0, batch_size: int=4)->torch.Tensor:
         """
         使用 self.model 获取每个 token 的 log probabilities
+        采用分批处理来避免OOM问题
         
         Args:
             sequences: [batch_size, seq_len] 的 token ids
+            attention_masks: [batch_size, seq_len] 的 attention masks
+            temperature: 温度参数
+            batch_size: 每批处理的样本数量，默认为4
             
         Returns:
             logprobs: [batch_size, seq_len] 的 log probabilities
         """
-        sequences = sequences.to(self.model.device)
-        rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
-        rolled_sequences = rolled_sequences.to(self.model.device)
-        attention_masks = attention_masks.to(self.model.device)
-        # 创建 attention mask (假设没有padding或者padding token是0)
-        # 创建 position ids
-        position_ids = attention_masks.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_masks == 0, 1)
+        total_samples = sequences.shape[0]
+        all_log_probs = []
         
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=sequences,
-                attention_mask=attention_masks,
-                position_ids=position_ids
-            )
+        # 分批处理
+        for i in range(0, total_samples, batch_size):
+            end_idx = min(i + batch_size, total_samples)
+            batch_sequences = sequences[i:end_idx]
+            batch_attention_masks = attention_masks[i:end_idx]
             
-            # 获取 logits: [batch_size, seq_len, vocab_size]
-            logits = outputs.logits
+            # 移动到GPU
+            batch_sequences = batch_sequences.to(self.model.device)
+            batch_attention_masks = batch_attention_masks.to(self.model.device)
             
-            # 计算 log probabilities
-            log_probs = log_probs_from_logits(logits, rolled_sequences, temperature)  # [batch_size, seq_len, vocab_size]
+            # 准备rolled sequences（用于计算log_probs）
+            rolled_sequences = torch.roll(batch_sequences, shifts=-1, dims=1)
             
-            # 获取每个位置实际 token 的 log probability
-            # 使用 gather 来选择对应 token 的 log prob
-            # token_log_probs = torch.gather(
-            #     log_probs, 
-            #     dim=-1, 
-            #     index=sequences.unsqueeze(-1)  # [batch_size, seq_len, 1]
-            # ).squeeze(-1)  # [batch_size, seq_len]
+            # 创建 position ids
+            position_ids = batch_attention_masks.long().cumsum(-1) - 1
+            position_ids.masked_fill_(batch_attention_masks == 0, 1)
             
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=batch_sequences,
+                    attention_mask=batch_attention_masks,
+                    position_ids=position_ids
+                )
+                
+                # 获取 logits: [batch_size, seq_len, vocab_size]
+                logits = outputs.logits
+                
+                # 立即移动到CPU以释放GPU内存
+                logits = logits.to('cpu')
+                rolled_sequences = rolled_sequences.to('cpu')
+                
+                # 计算 log probabilities
+                batch_log_probs = log_probs_from_logits(logits, rolled_sequences, temperature)
+                all_log_probs.append(batch_log_probs)
+                
+                # 显式删除大tensor以释放内存
+                del logits, outputs
+                torch.cuda.empty_cache()  # 清理GPU缓存
+            
+            # 显式删除batch数据
+            del batch_sequences, batch_attention_masks, position_ids, rolled_sequences
+        
+        # 合并所有批次的结果
+        log_probs = torch.cat(all_log_probs, dim=0)
         return log_probs
 
     def get_hidden_state_size(self)->int:
