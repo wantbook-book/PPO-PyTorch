@@ -17,7 +17,8 @@ SAE强度预测器训练脚本 - 重构版本
 - StrengthTrainer: 主训练类
 """
 
-from models.vllm_sampler import VllmSampler
+from models.vllm_sampler import VllmSampler, MultiVllmSampler
+from models.multiprocess_vllm_sampler import MultiProcessVllmSampler 
 from models.strengths_predictor import StrengthsPredictor
 import torch
 import torch.nn as nn
@@ -37,11 +38,12 @@ import numpy as np
 import time
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
+import json
 
 DEBUG = False
-# debugpy.listen(5678)
-# debugpy.wait_for_client()
-
+if DEBUG:
+    debugpy.listen(5678)
+    debugpy.wait_for_client()
 
 @dataclass
 class TrainingConfig:
@@ -60,6 +62,7 @@ class TrainingConfig:
     max_model_length: int = 2048
     max_input_len: int = 1024
     max_output_len: int = 1024
+    num_instances: int = 1
     
     # SAE相关
     sae_path: Optional[str] = None
@@ -130,9 +133,9 @@ class ModelManager:
         self.vllm_sampler = None
         self.strength_predictor = None
         self.optimizer = None
-        self.predictor_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        self.predictor_device = None
         
-    def initialize_models(self) -> Tuple[VllmSampler, StrengthsPredictor, torch.optim.Optimizer]:
+    def initialize_models(self) -> Tuple[MultiProcessVllmSampler, StrengthsPredictor, torch.optim.Optimizer]:
         """初始化所有模型"""
         # 配置VLLM参数
         llm_kwargs = {
@@ -161,8 +164,13 @@ class ModelManager:
         }
         
         # 初始化VLLM采样器
-        self.vllm_sampler = VllmSampler(llm_kwargs, sae_kwargs, sampling_kwargs)
-        
+        # self.vllm_sampler = VllmSampler(llm_kwargs, sae_kwargs, sampling_kwargs)
+        # 1~num_instances
+        self.vllm_sampler = MultiProcessVllmSampler(llm_kwargs, sae_kwargs, sampling_kwargs, self.config.num_instances, gpu_devices=[i for i in range(1, 1+self.config.num_instances)])
+        if 1+self.config.num_instances >= torch.cuda.device_count():
+            raise ValueError(f"1+num_instances({self.config.num_instances}) must be less than gpu_count({torch.cuda.device_count()})")
+
+        self.predictor_device = torch.device(f"cuda:{1+self.config.num_instances}")
         # 初始化强度预测器
         hidden_state_dim = self.vllm_sampler.get_hidden_state_size()
         feature_num = len(self.config.feature_idxs.split(','))
@@ -247,7 +255,7 @@ class MetricsLogger:
 class BatchProcessor:
     """批次数据处理类"""
     
-    def __init__(self, config: TrainingConfig, vllm_sampler: VllmSampler):
+    def __init__(self, config: TrainingConfig, vllm_sampler: MultiProcessVllmSampler):
         self.config = config
         self.vllm_sampler = vllm_sampler
         self.tokenizer = vllm_sampler.get_tokenizer()
@@ -330,6 +338,11 @@ class BatchProcessor:
         
         all_logprobs_tensor = torch.stack(padded_logprobs)
         
+        # 删除中间变量以释放显存
+        del sae_all_logprobs, padded_logprobs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return (sequences, attention_masks, action_masks, responses, resp_lens, 
                 sae_logprobs_tensor, all_logprobs_tensor)
 
@@ -356,19 +369,11 @@ class StrengthTrainer:
         
     def compute_batch_metrics(self, sequences: torch.Tensor, attention_masks: torch.Tensor, 
                             action_masks: torch.Tensor, responses: List[str], 
-                            prompts: List[str], answers: List[str], 
+                            repeated_prompts: List[str], repeated_answers: List[str], index: list[int],
                             sae_logprobs: torch.Tensor, all_logprobs_tensor: torch.Tensor,
                             resp_lens: List[float]) -> Dict[str, Any]:
         """计算批次指标"""
-        # 准备重复的prompts和answers
-        repeated_prompts = []
-        repeated_answers = []
-        index = []
-        for i in range(len(prompts)):
-            for _ in range(self.config.n_samples_per_prompt):
-                index.append(i)
-                repeated_prompts.append(prompts[i])
-                repeated_answers.append(answers[i])
+        
         
         # 计算rewards
         rewards = reward_func(responses, repeated_prompts, repeated_answers)
@@ -387,12 +392,24 @@ class StrengthTrainer:
         kl_penalty = compute_approx_kl(sae_logprobs, ref_logprobs)
         batch_kl_penalty = torch.mean(kl_penalty).item()
         
+        # 删除不再需要的tensor
+        del ref_logprobs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # 计算序列熵
         response_logprobs = all_logprobs_tensor[:, -action_masks.shape[1]:, :].to('cpu')
         sequence_entropies = compute_entropy(response_logprobs, action_masks, temperature=self.config.temperature)
         avg_sequence_entropy = torch.mean(sequence_entropies).item()
         
+        # 删除大型tensor
+        del response_logprobs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # 计算token级别rewards
+        # (N, n_sampler_per_prompt, seq_len)
+        # (N, n_sampler_per_prompt, 1)
         token_level_rewards = compute_reward(
             rewards, self.config.kl_coef, kl_penalty,
             action_mask=action_masks, reward_clip_range=self.config.reward_clip_range,
@@ -403,6 +420,14 @@ class StrengthTrainer:
             token_level_rewards, action_masks, index
         )
         
+        # 保存需要返回的值
+        batch_rewards_value = torch.mean(rewards).item()
+        
+        # 删除中间计算tensor
+        del returns
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return {
             'rewards': rewards,
             'kl_penalty': kl_penalty,
@@ -412,7 +437,7 @@ class StrengthTrainer:
             'token_level_rewards': token_level_rewards,
             'advantages': advantages,
             'resp_lens': resp_lens,
-            'batch_rewards': torch.mean(rewards).item(),
+            'batch_rewards': batch_rewards_value,
             'avg_response_length': np.mean(resp_lens),
             'response_length_std': np.std(resp_lens)
         }
@@ -423,17 +448,30 @@ class StrengthTrainer:
         prompts = batch['problem']
         answers = batch['answer']
         
+        # 准备重复的prompts和answers
+        repeated_prompts = []
+        repeated_answers = []
+        index = []
+        for i in range(len(prompts)):
+            for _ in range(self.config.n_samples_per_prompt):
+                index.append(i)
+                repeated_prompts.append(prompts[i])
+                repeated_answers.append(answers[i])
+
         # 获取hidden states
         hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
-        hidden_states = hidden_states.to(self.model_manager.predictor_device)
-        
+        repeated_hidden_states = hidden_states.repeat_interleave(self.config.n_samples_per_prompt, dim=0)
+        # hidden_states = hidden_states.to(self.model_manager.predictor_device)
+        repeated_hidden_states = repeated_hidden_states.to(self.model_manager.predictor_device)
+
         # 预测strengths
-        predicted_strengths = self.strength_predictor(hidden_states)
+        # (N, num_feature)
+        predicted_strengths = self.strength_predictor(repeated_hidden_states)
         strengths_values = predicted_strengths.detach().cpu().numpy()
         
         # 生成输出
         outputs = self.vllm_sampler.generate(
-            prompts, strengths_values.tolist(), self.config.n_samples_per_prompt
+            repeated_prompts, strengths_values.tolist(), 1
         )
         
         # 处理批次输出
@@ -443,24 +481,29 @@ class StrengthTrainer:
         # 计算指标
         metrics = self.compute_batch_metrics(
             sequences, attention_masks, action_masks, responses, 
-            prompts, answers, sae_logprobs, all_logprobs_tensor, resp_lens
+            repeated_prompts, repeated_answers, index,
+            sae_logprobs, all_logprobs_tensor, resp_lens
         )
+        
+        # 显式删除大型tensor以释放显存
+        del sequences, attention_masks, sae_logprobs, all_logprobs_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # 计算损失
         advantages = metrics['advantages'][:, :self.feature_num]
         advantages = advantages.to(self.model_manager.predictor_device)
         
-        new_predicted_strengths = self.strength_predictor(hidden_states)
-        new_predicted_strengths = new_predicted_strengths.repeat_interleave(
-            self.config.n_samples_per_prompt, dim=0
-        )
-        old_predicted_strengths = predicted_strengths.detach().repeat_interleave(
-            self.config.n_samples_per_prompt, dim=0
-        )
-        
+        # 避免重复计算，直接使用之前计算的predicted_strengths
+        # new_predicted_strengths = self.strength_predictor(repeated_hidden_states)
+        new_predicted_strengths = predicted_strengths
+        old_predicted_strengths = predicted_strengths.detach()
+        avg_strength_entropy = -(old_predicted_strengths * torch.log(old_predicted_strengths)).sum(dim=-1).mean().item()
+
         strength_mask = torch.ones_like(advantages, dtype=torch.bool)
         
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+            # ratio，实际上old_predicted_strengths和new应该是一样的值，old detach了
             old_log_prob=old_predicted_strengths,
             log_prob=new_predicted_strengths,
             advantages=advantages,
@@ -475,49 +518,105 @@ class StrengthTrainer:
         # 反向传播
         self.optimizer.zero_grad()
         pg_loss.backward()
+        
+        # 计算梯度范数
+        total_norm = 0.0
+        for param in self.strength_predictor.parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        grad_norm = total_norm ** (1. / 2)
+        
         self.optimizer.step()
         
+        # 保存loss值用于返回
+        policy_loss_value = pg_loss.item()
+        advantages_mean_value = torch.mean(advantages).item()
+        
+        # 删除训练过程中的tensor
+        del hidden_states, predicted_strengths, repeated_hidden_states, advantages
+        del new_predicted_strengths, old_predicted_strengths, strength_mask
+        del pg_loss
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return {
-            'policy_loss': pg_loss.item(),
+            'policy_loss': policy_loss_value,
             'kl_penalty': metrics['batch_kl_penalty'],
             'rewards_mean': metrics['batch_rewards'],
-            'advantages_mean': torch.mean(advantages).item(),
+            'advantages_mean': advantages_mean_value,
             'ppo_kl': ppo_kl,
             'sequence_entropy': metrics['avg_sequence_entropy'],
+            'strengths_entropy': avg_strength_entropy,
             'response_length_mean': metrics['avg_response_length'],
             'response_length_std': metrics['response_length_std'],
+            'grad_norm': grad_norm,
             'strengths_values': strengths_values
         }
     
-    def validate(self) -> Dict[str, float]:
+    def validate(self, global_step) -> Dict[str, float]:
         """执行验证"""
+        
+        
         self.strength_predictor.eval()
         correct_num = 0
         val_start_time = time.time()
         
+        # 创建保存目录
+        # os.makedirs(self.config.save_dir, exist_ok=True)
+        eval_dir = os.path.join(self.config.save_dir, "validation_results")
+        os.makedirs(eval_dir, exist_ok=True)
+        eval_file = os.path.join(eval_dir, f"{global_step}_outputs.jsonl")
+        metrics_file = os.path.join(eval_dir, f"{global_step}_metrics.json")
+        
         with torch.no_grad():
-            for batch in tqdm(self.test_loader, desc="Validation"):
-                prompts = batch['problem']
-                answers = batch['answer']
-                
-                hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
-                hidden_states = hidden_states.to(self.model_manager.predictor_device)
-                predicted_strengths = self.strength_predictor(hidden_states)
-                
-                outputs = self.vllm_sampler.generate(
-                    prompts, predicted_strengths.detach().cpu().numpy().tolist(), 1
-                )
-                
-                responses = [output.outputs[0].text for output in outputs]
-                rewards = reward_func(responses, prompts, answers)
-                
-                if not isinstance(rewards, torch.Tensor):
-                    rewards = torch.tensor(rewards)
-                rewards = rewards.to("cpu")
-                correct_num += (rewards > 0).sum().item()
+            with open(eval_file, 'w', encoding='utf-8') as f:
+                for batch in tqdm(self.test_loader, desc="Validation"):
+                    idxs = batch['idx'].tolist()
+                    prompts = batch['problem']
+                    answers = batch['answer']
+                    
+                    hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
+                    hidden_states = hidden_states.to(self.model_manager.predictor_device)
+                    predicted_strengths = self.strength_predictor(hidden_states)
+                    
+                    outputs = self.vllm_sampler.generate(
+                        prompts, predicted_strengths.detach().cpu().numpy().tolist(), 1
+                    )
+                    
+                    responses = [output.outputs[0].text for output in outputs]
+                    rewards = reward_func(responses, prompts, answers)
+                    
+                    if not isinstance(rewards, torch.Tensor):
+                        rewards = torch.tensor(rewards)
+                    rewards = rewards.to("cpu")
+                    correct_num += (rewards > 0).sum().item()
+                    
+                    # 保存每个样本的结果到jsonl文件
+                    for (idx, problem, answer, response) in zip(idxs, prompts, answers, responses):
+                        result = {
+                            "problem": problem,
+                            "answer": answer,
+                            "idx": idx,
+                            "model_response": response
+                        }
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    
+                    # 显式删除tensor以释放显存
+                    del hidden_states, predicted_strengths, rewards
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         
         val_duration = time.time() - val_start_time
         accuracy = correct_num / len(self.test_loader.dataset) * 100
+        # Save metrics to json file
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'accuracy': accuracy,
+                'duration': val_duration
+            }, f, ensure_ascii=False, indent=4)
+        print(f"验证指标已保存到: {metrics_file}")
+        print(f"验证结果已保存到: {eval_file}")
+        
         
         return {
             'accuracy': accuracy,
@@ -568,10 +667,13 @@ class StrengthTrainer:
                 
                 # 验证
                 if self.test_loader and global_step % self.config.eval_interval == 0:
-                    val_metrics = self.validate()
+                    val_metrics = self.validate(global_step)
                     val_metrics['epoch'] = epoch + 1
                     self.logger.log_validation_metrics(val_metrics, global_step)
                     print(f"Epoch {epoch+1}, Validation accuracy: {val_metrics['accuracy']:.1f}%, Duration: {val_metrics['duration']:.2f}s")
+                    # 验证后清理显存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
                 # 保存模型
                 if global_step % self.config.save_interval == 0:
@@ -588,6 +690,10 @@ class StrengthTrainer:
             
             self.logger.log_epoch_metrics(avg_metrics, global_step)
             print(f"Epoch {epoch+1}/{self.config.num_epochs}, Average Loss: {avg_metrics['loss']:.4f}, Duration: {epoch_duration:.2f}s")
+            
+            # 每个epoch结束后清理显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # 完成训练
         self.logger.log_training_metrics({'completed': 1, 'total_steps': global_step}, global_step)
@@ -614,6 +720,7 @@ def create_config_from_args(args) -> TrainingConfig:
         max_model_length=args.max_model_length,
         max_input_len=args.max_input_len,
         max_output_len=args.max_output_len,
+        num_instances=args.num_instances,
         
         # SAE相关
         sae_path=args.sae_path,
@@ -691,6 +798,7 @@ if __name__ == '__main__':
     parser.add_argument("--train_prompt_path", type=str, default=None, help="Path to prompt")
     parser.add_argument("--test_prompt_path", type=str, default=None, help="Path to prompt")
     parser.add_argument("--eval_interval", type=int, default=100, help="Evaluation interval")
+    parser.add_argument("--num_instances", type=int, default=1, help="the number of vllm instances")
     args = parser.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     main(args)

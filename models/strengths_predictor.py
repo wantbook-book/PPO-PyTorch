@@ -26,29 +26,35 @@ class StrengthsPredictor(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, output_dim),
-            nn.Sigmoid()  # Output strengths score between 0 and 1
+            # nn.Sigmoid()  # Output strengths score between 0 and 1
+            nn.Softmax(dim=-1)  # Output probability distribution over strengths
         )
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize network weights using Xavier/Glorot initialization for better training stability"""
+        """Initialize network weights to produce outputs close to 0 with diversity"""
         layers = list(self.network.children())
         for i, module in enumerate(layers):
             if isinstance(module, nn.Linear):
-                # Xavier uniform initialization for hidden layers
-                nn.init.xavier_uniform_(module.weight)
-                
                 # 特殊处理最后一层（输出层）
                 if i == len(layers) - 2:  # 最后一个Linear层（Sigmoid前）
-                    # 使用更小的权重初始化，让Sigmoid输出更接近0.5
-                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    # 使用小的权重初始化增加多样性
+                    nn.init.normal_(module.weight, mean=0.0, std=0.1)
                     if module.bias is not None:
-                        # 初始化bias为0，让初始输出接近0.5
+                        # 初始化bias为负值，让Sigmoid输出接近0
+                        # 添加小的随机噪声增加多样性
+                        bias_init = -2.0 + torch.randn(module.bias.shape) * 0.2
                         nn.init.constant_(module.bias, 0.0)
+                        module.bias.data = bias_init
                 else:
-                    # 隐藏层bias初始化为小正值避免死神经元
+                    # 隐藏层使用Xavier初始化但添加噪声
+                    nn.init.xavier_uniform_(module.weight)
+                    # 添加小的随机噪声到权重
+                    module.weight.data += torch.randn_like(module.weight) * 0.01
+                    
+                    # 隐藏层bias初始化为小的随机值
                     if module.bias is not None:
-                        nn.init.constant_(module.bias, 0.01)
+                        nn.init.uniform_(module.bias, -0.02, 0.02)
     
     def forward(self, state):
         # 如果类型不同，转化为参数类型

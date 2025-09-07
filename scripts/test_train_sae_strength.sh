@@ -10,9 +10,9 @@ tensor_parallel_size=1
 
 top_p=0.95
 temperature=0.6
-max_model_length=22048
+max_model_length=8000
 max_input_len=2048
-max_output_len=20000
+max_output_len=5000
 gpu_util=0.8
 lr=1e-4
 kl_coef=0
@@ -26,20 +26,20 @@ train_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
 test_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
 
 model="/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-num_instances=6
+num_instances=4
 sae_release=andreuka18/deepseek-r1-distill-llama-8b-lmsys-openthoughts
 sae_id=blocks.19.hook_resid_post
 save_dir="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B"
 save_interval=50
 eval_interval=10
 num_epochs=2
-batch_size=4
+batch_size=2
 feature_idxs=13023,19510,21893,25591,33275,43427,50670,51021,54249,61353
 # max_activations=20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0
 max_activations=10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0
 
 loss_agg_mode="token-mean"
-n_samples_per_prompt=16
+n_samples_per_prompt=2
 
 python train_sae_strength.py \
     --train_data_path $train_data_path \

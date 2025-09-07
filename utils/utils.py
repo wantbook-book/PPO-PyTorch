@@ -42,6 +42,9 @@ def compute_entropy(logprobs: torch.Tensor, action_mask: Optional[torch.Tensor] 
     # log_probs = F.log_softmax(logits, dim=-1)
     # Compute probabilities
     probs = logprobs.exp()
+
+    # Replace -inf values with 0 in logprobs
+    logprobs = torch.where(torch.isinf(logprobs), torch.zeros_like(logprobs), logprobs)
     
     # Compute entropy: -sum(p * log(p))
     entropy = -(probs * logprobs).sum(dim=-1)
