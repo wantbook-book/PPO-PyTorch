@@ -7,11 +7,10 @@ tests/test_dataloader.ipynb
 *.so
 train_eval_outputs_dir/
 train_samples_dir/
-tests/
 dataset/math/covo_train_with_idx_reason_prefix.jsonl
 dataset/math/covo_train.jsonl
 dataset/math/covo_train_with_idx.jsonl
-
+checkpoints/
 # Distribution / packaging
 .Python
 build/
