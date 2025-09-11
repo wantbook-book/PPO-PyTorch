@@ -39,11 +39,27 @@ import time
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 import json
+import gc
 
 DEBUG = False
 if DEBUG:
     debugpy.listen(5678)
     debugpy.wait_for_client()
+
+def get_memory_info(device=None):
+    """获取内存使用信息"""
+    if torch.cuda.is_available() and device is not None:
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        return f"GPU {device}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+    return "CUDA not available"
+
+def force_cleanup():
+    """强制清理内存"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 @dataclass
 class TrainingConfig:
@@ -76,6 +92,7 @@ class TrainingConfig:
     top_p: float = 0.95
     n_samples_per_prompt: int = 1
     logprobs: int = 128000
+    intensity_std: float = 0.1
     
     # 训练相关
     lr: float = 1e-4
@@ -224,12 +241,21 @@ class MetricsLogger:
     def log_strength_stats(self, strengths_values: np.ndarray, step: int):
         """记录强度预测统计信息"""
         if not self.debug:
-            swanlab.log({
+            # Create metrics dictionary
+            metrics = {
                 "strength_stats/mean": np.mean(strengths_values),
-                "strength_stats/std": np.std(strengths_values),
+                "strength_stats/std": np.std(strengths_values), 
                 "strength_stats/min": np.min(strengths_values),
-                "strength_stats/max": np.max(strengths_values),
-            }, step=step)
+                "strength_stats/max": np.max(strengths_values)
+            }
+            
+            # Add per-feature metrics
+            for i in range(strengths_values.shape[1]):
+                metrics[f"strength_stats/mean_{i}"] = np.mean(strengths_values[:, i])
+                metrics[f"strength_stats/std_{i}"] = np.std(strengths_values[:, i])
+                
+            # Log all metrics
+            swanlab.log(metrics, step=step)
     
     def log_training_metrics(self, metrics: Dict[str, float], step: int):
         """记录训练指标"""
@@ -288,25 +314,25 @@ class BatchProcessor:
             responses.append(output.outputs[0].text)
             
             # 处理logprobs
-            token_logprobs = []
-            all_token_logprobs = []
+            # token_logprobs = []
+            # all_token_logprobs = []
             
-            for i, token_data in enumerate(output.outputs[0].logprobs):
-                if token_data is not None:
-                    sampled_token_id = output.outputs[0].token_ids[i]
-                    token_logprobs.append(token_data[sampled_token_id].logprob)
+            # for i, token_data in enumerate(output.outputs[0].logprobs):
+            #     if token_data is not None:
+            #         sampled_token_id = output.outputs[0].token_ids[i]
+            #         token_logprobs.append(token_data[sampled_token_id].logprob)
                     
-                    # 获取所有token的logprobs
-                    token_logprob_tensor = torch.full((self.config.logprobs,), float('-inf'))
-                    for idx, (token_id, logprob_obj) in enumerate(token_data.items()):
-                        if idx < self.config.logprobs:
-                            token_logprob_tensor[idx] = logprob_obj.logprob
-                    all_token_logprobs.append(token_logprob_tensor)
-                else:
-                    raise ValueError(f"token_data is None for output {output}")
+            #         # 获取所有token的logprobs
+            #         token_logprob_tensor = torch.full((self.config.logprobs,), float('-inf'))
+            #         for idx, (token_id, logprob_obj) in enumerate(token_data.items()):
+            #             if idx < self.config.logprobs:
+            #                 token_logprob_tensor[idx] = logprob_obj.logprob
+            #         all_token_logprobs.append(token_logprob_tensor)
+            #     else:
+            #         raise ValueError(f"token_data is None for output {output}")
             
-            sae_logprobs.append(token_logprobs)
-            sae_all_logprobs.append(torch.stack(all_token_logprobs))
+            # sae_logprobs.append(token_logprobs)
+            # sae_all_logprobs.append(torch.stack(all_token_logprobs))
         
         # 转换为tensor
         sequences = torch.tensor(sequences).to("cpu")
@@ -318,33 +344,33 @@ class BatchProcessor:
         )
         
         # 处理sae_logprobs
-        max_len = action_masks.shape[1]
-        processed_sae_logprobs = []
-        for logprobs in sae_logprobs:
-            if len(logprobs) > max_len:
-                raise ValueError(f"logprobs长度大于max_len: {len(logprobs)} > {max_len}")
-            else:
-                processed_sae_logprobs.append(logprobs + [0.0] * (max_len - len(logprobs)))
+        # max_len = action_masks.shape[1]
+        # processed_sae_logprobs = []
+        # for logprobs in sae_logprobs:
+        #     if len(logprobs) > max_len:
+        #         raise ValueError(f"logprobs长度大于max_len: {len(logprobs)} > {max_len}")
+        #     else:
+        #         processed_sae_logprobs.append(logprobs + [0.0] * (max_len - len(logprobs)))
         
-        sae_logprobs_tensor = torch.tensor(processed_sae_logprobs)
+        # sae_logprobs_tensor = torch.tensor(processed_sae_logprobs)
         
         # 处理all_logprobs
-        padded_logprobs = []
-        for seq_logprobs in sae_all_logprobs:
-            if len(seq_logprobs) < max_len:
-                padding = torch.full((max_len - len(seq_logprobs), self.config.logprobs), float('-inf'))
-                seq_logprobs = torch.cat([seq_logprobs, padding], dim=0)
-            padded_logprobs.append(seq_logprobs)
+        # padded_logprobs = []
+        # for seq_logprobs in sae_all_logprobs:
+        #     if len(seq_logprobs) < max_len:
+        #         padding = torch.full((max_len - len(seq_logprobs), self.config.logprobs), float('-inf'))
+        #         seq_logprobs = torch.cat([seq_logprobs, padding], dim=0)
+        #     padded_logprobs.append(seq_logprobs)
         
-        all_logprobs_tensor = torch.stack(padded_logprobs)
+        # all_logprobs_tensor = torch.stack(padded_logprobs)
         
         # 删除中间变量以释放显存
-        del sae_all_logprobs, padded_logprobs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # del sae_all_logprobs, padded_logprobs
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
         
         return (sequences, attention_masks, action_masks, responses, resp_lens, 
-                sae_logprobs_tensor, all_logprobs_tensor)
+                None, None)
 
 
 class StrengthTrainer:
@@ -366,7 +392,12 @@ class StrengthTrainer:
         
         # 计算特征数量
         self.feature_num = len(config.feature_idxs.split(','))
+
+        # 采样intensity强度的方差
+        # 0.6
+        self.intensity_var = torch.full((self.feature_num, ), self.config.intensity_std * self.config.intensity_std)
         
+
     def compute_batch_metrics(self, sequences: torch.Tensor, attention_masks: torch.Tensor, 
                             action_masks: torch.Tensor, responses: List[str], 
                             repeated_prompts: List[str], repeated_answers: List[str], index: list[int],
@@ -385,48 +416,52 @@ class StrengthTrainer:
         print(f"[TIMING] 计算rewards用时: {rewards_time:.4f}s")
         
         # 计算reference logprobs
-        ref_logprobs_start_time = time.time()
-        ref_logprobs = self.vllm_sampler.get_logprobs(sequences, attention_masks)
-        ref_logprobs = ref_logprobs.to('cpu')
-        ref_logprobs = ref_logprobs[:, :-1]
-        ref_logprobs = ref_logprobs[:, -action_masks.shape[1]:] * action_masks.float()
-        ref_logprobs_time = time.time() - ref_logprobs_start_time
-        print(f"[TIMING] 计算reference logprobs用时: {ref_logprobs_time:.4f}s")
+        # ref_logprobs_start_time = time.time()
+        # ref_logprobs = self.vllm_sampler.get_logprobs(sequences, attention_masks)
+        # ref_logprobs = ref_logprobs.to('cpu')
+        # ref_logprobs = ref_logprobs[:, :-1]
+        # ref_logprobs = ref_logprobs[:, -action_masks.shape[1]:] * action_masks.float()
+        # ref_logprobs_time = time.time() - ref_logprobs_start_time
+        # print(f"[TIMING] 计算reference logprobs用时: {ref_logprobs_time:.4f}s")
         
         # 计算KL penalty
-        kl_penalty_start_time = time.time()
-        sae_logprobs = sae_logprobs.to('cpu')
-        kl_penalty = compute_approx_kl(sae_logprobs, ref_logprobs)
-        batch_kl_penalty = torch.mean(kl_penalty).item()
-        kl_penalty_time = time.time() - kl_penalty_start_time
-        print(f"[TIMING] 计算KL penalty用时: {kl_penalty_time:.4f}s")
+        # kl_penalty_start_time = time.time()
+        # sae_logprobs = sae_logprobs.to('cpu')
+        # kl_penalty = compute_approx_kl(sae_logprobs, ref_logprobs)
+        # batch_kl_penalty = torch.mean(kl_penalty).item()
+        # kl_penalty_time = time.time() - kl_penalty_start_time
+        # print(f"[TIMING] 计算KL penalty用时: {kl_penalty_time:.4f}s")
         
         # 删除不再需要的tensor
-        del ref_logprobs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # del ref_logprobs
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
         
         # 计算序列熵
-        entropy_start_time = time.time()
-        response_logprobs = all_logprobs_tensor[:, -action_masks.shape[1]:, :].to('cpu')
-        sequence_entropies = compute_entropy(response_logprobs, action_masks, temperature=self.config.temperature)
-        avg_sequence_entropy = torch.mean(sequence_entropies).item()
-        entropy_time = time.time() - entropy_start_time
-        print(f"[TIMING] 计算序列熵用时: {entropy_time:.4f}s")
+        # entropy_start_time = time.time()
+        # response_logprobs = all_logprobs_tensor[:, -action_masks.shape[1]:, :].to('cpu')
+        # sequence_entropies = compute_entropy(response_logprobs, action_masks, temperature=self.config.temperature)
+        # avg_sequence_entropy = torch.mean(sequence_entropies).item()
+        # entropy_time = time.time() - entropy_start_time
+        # print(f"[TIMING] 计算序列熵用时: {entropy_time:.4f}s")
         
         # 删除大型tensor
-        del response_logprobs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # del response_logprobs
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
         
         # 计算token级别rewards
         token_rewards_start_time = time.time()
         # (N, n_sampler_per_prompt, seq_len)
         # (N, n_sampler_per_prompt, 1)
+        # 使用更小的临时tensor以节省内存
+        kl_penalty_tensor = torch.zeros_like(sequences.to('cpu'))
         token_level_rewards = compute_reward(
-            rewards, self.config.kl_coef, kl_penalty,
+            rewards, self.config.kl_coef, kl_penalty_tensor,
             action_mask=action_masks, reward_clip_range=self.config.reward_clip_range,
         )
+        # 立即释放不需要的tensor
+        del kl_penalty_tensor
         token_rewards_time = time.time() - token_rewards_start_time
         print(f"[TIMING] 计算token级别rewards用时: {token_rewards_time:.4f}s")
         
@@ -440,9 +475,11 @@ class StrengthTrainer:
         
         # 保存需要返回的值
         batch_rewards_value = torch.mean(rewards).item()
+        avg_response_length = np.mean(resp_lens)
+        response_length_std = np.std(resp_lens)
         
         # 删除中间计算tensor
-        del returns
+        del returns, token_level_rewards, rewards
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
@@ -452,16 +489,15 @@ class StrengthTrainer:
         
         return {
             'rewards': rewards,
-            'kl_penalty': kl_penalty,
-            'batch_kl_penalty': batch_kl_penalty,
-            'sequence_entropies': sequence_entropies,
-            'avg_sequence_entropy': avg_sequence_entropy,
+            # 'kl_penalty': kl_penalty,
+            # 'batch_kl_penalty': batch_kl_penalty,
+            # 'sequence_entropies': sequence_entropies,
+            # 'avg_sequence_entropy': avg_sequence_entropy,
             'token_level_rewards': token_level_rewards,
             'advantages': advantages,
-            'resp_lens': resp_lens,
             'batch_rewards': batch_rewards_value,
-            'avg_response_length': np.mean(resp_lens),
-            'response_length_std': np.std(resp_lens)
+            'avg_response_length': avg_response_length,
+            'response_length_std': response_length_std
         }
     
     def train_step(self, batch) -> Dict[str, float]:
@@ -488,16 +524,47 @@ class StrengthTrainer:
         # 获取hidden states
         hidden_start_time = time.time()
         hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
-        repeated_hidden_states = hidden_states.repeat_interleave(self.config.n_samples_per_prompt, dim=0)
-        # hidden_states = hidden_states.to(self.model_manager.predictor_device)
-        repeated_hidden_states = repeated_hidden_states.to(self.model_manager.predictor_device)
+        # repeated_hidden_states = hidden_states.repeat_interleave(self.config.n_samples_per_prompt, dim=0)
+        hidden_states = hidden_states.to(self.model_manager.predictor_device)
+        # repeated_hidden_states = repeated_hidden_states.to(self.model_manager.predictor_device)
         hidden_time = time.time() - hidden_start_time
         print(f"[TIMING] 获取hidden states用时: {hidden_time:.4f}s")
 
         # 预测strengths
         predict_start_time = time.time()
         # (N, num_feature)
-        predicted_strengths = self.strength_predictor(repeated_hidden_states)
+        # predicted_strengths = self.strength_predictor(repeated_hidden_states)
+        predicted_mu_strengths = self.strength_predictor(hidden_states)
+        predicted_mu_strengths = predicted_mu_strengths.to('cpu')
+        
+        # 为每组mu搭配固定的var，采样n_samples_per_prompt组strengths
+        # predicted_mu_strengths: (N, num_feature)
+        # self.intensity_var: (num_feature,)
+        # 创建协方差矩阵 (num_feature, num_feature)
+        cov_mat = torch.diag(self.intensity_var)
+        # 存储所有采样结果
+        all_predicted_strengths = []
+        all_predicted_strengths_logprobs = []
+        # 对每个样本进行n_samples_per_prompt次采样
+        for i in range(predicted_mu_strengths.shape[0]):
+            # 当前样本的mu: (num_feature,)
+            mu_i = predicted_mu_strengths[i]
+            # 创建多变量正态分布采样器
+            strengths_sampler = torch.distributions.MultivariateNormal(mu_i, cov_mat)
+            # 采样n_samples_per_prompt次: (n_samples_per_prompt, num_feature)
+            samples_i = strengths_sampler.sample((self.config.n_samples_per_prompt,))
+            all_predicted_strengths.append(samples_i)
+            all_predicted_strengths_logprobs.append(strengths_sampler.log_prob(samples_i))
+            # 立即删除采样器以释放内存
+            del strengths_sampler
+        
+        # 拼接所有采样结果: (N*n_samples_per_prompt, num_feature)
+        predicted_strengths = torch.cat(all_predicted_strengths, dim=0)
+        predicted_strengths_logprobs = torch.cat(all_predicted_strengths_logprobs, dim=0)
+        
+        # 释放中间变量
+        del all_predicted_strengths, all_predicted_strengths_logprobs, cov_mat
+        
         strengths_values = predicted_strengths.detach().cpu().numpy()
         predict_time = time.time() - predict_start_time
         print(f"[TIMING] 预测strengths用时: {predict_time:.4f}s")
@@ -517,6 +584,11 @@ class StrengthTrainer:
         process_time = time.time() - process_start_time
         print(f"[TIMING] 处理批次输出用时: {process_time:.4f}s")
         
+        # 立即释放outputs以节省内存
+        del outputs
+        
+        sae_logprobs = None
+        all_logprobs_tensor = None
         # 计算指标
         metrics_start_time = time.time()
         metrics = self.compute_batch_metrics(
@@ -527,10 +599,11 @@ class StrengthTrainer:
         metrics_time = time.time() - metrics_start_time
         print(f"[TIMING] 计算指标用时: {metrics_time:.4f}s")
         
-        # 显式删除大型tensor以释放显存
-        del sequences, attention_masks, sae_logprobs, all_logprobs_tensor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 释放不再需要的大型变量
+        del sequences, attention_masks, action_masks, responses
+        del repeated_prompts, repeated_answers, index
+        
+       
         
         # 计算损失
         loss_start_time = time.time()
@@ -539,16 +612,21 @@ class StrengthTrainer:
         
         # 避免重复计算，直接使用之前计算的predicted_strengths
         # new_predicted_strengths = self.strength_predictor(repeated_hidden_states)
-        new_predicted_strengths = predicted_strengths
-        old_predicted_strengths = predicted_strengths.detach()
-        avg_strength_entropy = -(old_predicted_strengths * torch.log(old_predicted_strengths)).sum(dim=-1).mean().item()
+        predicted_strengths_probs = torch.exp(predicted_strengths_logprobs)
+        old_predicted_strengths_probs = predicted_strengths_probs.detach()
+        # new_predicted_strengths = predicted_strengths
+        # old_predicted_strengths = predicted_strengths.detach()
+        avg_strength_entropy = -(old_predicted_strengths_probs * torch.log(old_predicted_strengths_probs + 1e-8)).sum(dim=-1).mean().item()
 
         strength_mask = torch.ones_like(advantages, dtype=torch.bool)
+
+        old_predicted_strengths_probs = old_predicted_strengths_probs.to(self.model_manager.predictor_device)
+        predicted_strengths_probs = predicted_strengths_probs.to(self.model_manager.predictor_device)
         
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
             # ratio，实际上old_predicted_strengths和new应该是一样的值，old detach了
-            old_log_prob=old_predicted_strengths,
-            log_prob=new_predicted_strengths,
+            old_log_prob=old_predicted_strengths_probs,
+            log_prob=predicted_strengths_probs,
             advantages=advantages,
             response_mask=strength_mask,
             cliprange=self.config.clip_range,
@@ -582,9 +660,11 @@ class StrengthTrainer:
         advantages_mean_value = torch.mean(advantages).item()
         
         # 删除训练过程中的tensor
-        del hidden_states, predicted_strengths, repeated_hidden_states, advantages
-        del new_predicted_strengths, old_predicted_strengths, strength_mask
-        del pg_loss
+        del hidden_states, predicted_mu_strengths, predicted_strengths, advantages
+        del predicted_strengths_probs, predicted_strengths_logprobs, old_predicted_strengths_probs
+        del strength_mask, pg_loss
+        
+        # 强制清理显存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
@@ -593,16 +673,24 @@ class StrengthTrainer:
         print(f"[TIMING] 总训练步骤用时: {total_time:.4f}s")
         print(f"[TIMING] ========================================")
         
+        # 保存需要返回的指标，避免保持对metrics的引用
+        batch_rewards = metrics['batch_rewards']
+        avg_response_length = metrics['avg_response_length']
+        response_length_std = metrics['response_length_std']
+        
+        # 释放metrics字典
+        del metrics
+        
         return {
             'policy_loss': policy_loss_value,
-            'kl_penalty': metrics['batch_kl_penalty'],
-            'rewards_mean': metrics['batch_rewards'],
+            'kl_penalty': 0.0,  # 暂时设为0，因为已注释掉相关计算
+            'rewards_mean': batch_rewards,
             'advantages_mean': advantages_mean_value,
             'ppo_kl': ppo_kl,
-            'sequence_entropy': metrics['avg_sequence_entropy'],
+            'sequence_entropy': 0.0,  # 暂时设为0，因为已注释掉相关计算
             'strengths_entropy': avg_strength_entropy,
-            'response_length_mean': metrics['avg_response_length'],
-            'response_length_std': metrics['response_length_std'],
+            'response_length_mean': avg_response_length,
+            'response_length_std': response_length_std,
             'grad_norm': grad_norm,
             'strengths_values': strengths_values
         }
@@ -657,8 +745,7 @@ class StrengthTrainer:
                     
                     # 显式删除tensor以释放显存
                     del hidden_states, predicted_strengths, rewards
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    force_cleanup()
         
         val_duration = time.time() - val_start_time
         accuracy = correct_num / len(self.test_loader.dataset) * 100
@@ -726,8 +813,8 @@ class StrengthTrainer:
                     self.logger.log_validation_metrics(val_metrics, global_step)
                     print(f"Epoch {epoch+1}, Validation accuracy: {val_metrics['accuracy']:.1f}%, Duration: {val_metrics['duration']:.2f}s")
                     # 验证后清理显存
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    force_cleanup()
+                    print(f"[MEMORY] 验证后: {get_memory_info(self.model_manager.predictor_device)}")
                 
                 # 保存模型
                 if global_step % self.config.save_interval == 0:
@@ -749,8 +836,8 @@ class StrengthTrainer:
             print(f"Epoch {epoch+1}/{self.config.num_epochs}, Average Loss: {avg_metrics['loss']:.4f}, Duration: {epoch_duration:.2f}s")
             
             # 每个epoch结束后清理显存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            force_cleanup()
+            print(f"[MEMORY] Epoch {epoch+1}结束后: {get_memory_info(self.model_manager.predictor_device)}")
         
         # 完成训练
         self.logger.log_training_metrics({'completed': 1, 'total_steps': global_step}, global_step)
@@ -791,6 +878,7 @@ def create_config_from_args(args) -> TrainingConfig:
         top_p=args.top_p,
         n_samples_per_prompt=args.n_samples_per_prompt,
         logprobs=args.logprobs,
+        intensity_std=args.intensity_std,
         
         # 训练相关
         lr=args.lr,
@@ -856,6 +944,7 @@ if __name__ == '__main__':
     parser.add_argument("--test_prompt_path", type=str, default=None, help="Path to prompt")
     parser.add_argument("--eval_interval", type=int, default=100, help="Evaluation interval")
     parser.add_argument("--num_instances", type=int, default=1, help="the number of vllm instances")
+    parser.add_argument('--intensity_std', type=float, default=0.1, help="Standard deviation of intensity")
     args = parser.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     main(args)

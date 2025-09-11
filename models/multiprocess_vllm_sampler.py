@@ -365,6 +365,11 @@ class MultiProcessVllmSampler:
             process.start()
             self.processes.append(process)
             logger.info(f"Started worker process {i} (PID: {process.pid}) on GPU {self.gpu_devices[i]}")
+            
+            # 在启动下一个进程前等待1秒，避免资源竞争
+            if i < self.num_processes - 1:  # 最后一个进程不需要等待
+                time.sleep(1.0)
+                logger.info(f"Waiting 1 second before starting next process...")
         
         # 等待所有进程初始化完成
         self._wait_for_initialization()

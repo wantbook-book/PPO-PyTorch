@@ -21,13 +21,13 @@ class StrengthsPredictor(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),  # 添加dropout防止过拟合
+            # nn.Dropout(0.1),  # 添加dropout防止过拟合
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            # nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, output_dim),
-            # nn.Sigmoid()  # Output strengths score between 0 and 1
-            nn.Softmax(dim=-1)  # Output probability distribution over strengths
+            nn.Sigmoid()  # Output strengths score between 0 and 1
+            # nn.Softmax(dim=-1)  # Output probability distribution over strengths
         )
         self._init_weights()
     

@@ -40,6 +40,7 @@ max_activations=10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0
 
 loss_agg_mode="token-mean"
 n_samples_per_prompt=2
+intensity_std=0.1
 
 python train_sae_strength.py \
     --train_data_path $train_data_path \
@@ -73,4 +74,5 @@ python train_sae_strength.py \
     --vocab_size $vocab_size \
     --logprobs $logprobs \
     --eval_interval $eval_interval \
-    --num_instances $num_instances
+    --num_instances $num_instances \
+    --intensity_std $intensity_std
