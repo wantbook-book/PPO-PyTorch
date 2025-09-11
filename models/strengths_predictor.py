@@ -32,29 +32,11 @@ class StrengthsPredictor(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize network weights to produce outputs close to 0 with diversity"""
-        layers = list(self.network.children())
-        for i, module in enumerate(layers):
+        # Initialize weights using Xavier/Glorot initialization
+        for module in self.network:
             if isinstance(module, nn.Linear):
-                # 特殊处理最后一层（输出层）
-                if i == len(layers) - 2:  # 最后一个Linear层（Sigmoid前）
-                    # 使用小的权重初始化增加多样性
-                    nn.init.normal_(module.weight, mean=0.0, std=0.1)
-                    if module.bias is not None:
-                        # 初始化bias为负值，让Sigmoid输出接近0
-                        # 添加小的随机噪声增加多样性
-                        bias_init = -2.0 + torch.randn(module.bias.shape) * 0.2
-                        nn.init.constant_(module.bias, 0.0)
-                        module.bias.data = bias_init
-                else:
-                    # 隐藏层使用Xavier初始化但添加噪声
-                    nn.init.xavier_uniform_(module.weight)
-                    # 添加小的随机噪声到权重
-                    module.weight.data += torch.randn_like(module.weight) * 0.01
-                    
-                    # 隐藏层bias初始化为小的随机值
-                    if module.bias is not None:
-                        nn.init.uniform_(module.bias, -0.02, 0.02)
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
     
     def forward(self, state):
         # 如果类型不同，转化为参数类型

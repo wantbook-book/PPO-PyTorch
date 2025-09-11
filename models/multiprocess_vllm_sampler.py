@@ -25,6 +25,7 @@ import pickle
 import copy
 from typing import List, Tuple, Dict, Any, Optional
 import logging
+from tqdm import tqdm
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +47,7 @@ class VllmWorkerProcess:
         # 在进程中初始化时设置
         self.vllm_sampler = None
         self.initialized = False
+        self.tokenizer = None
     
     def initialize(self):
         """在工作进程中初始化VllmSampler"""
@@ -75,18 +77,24 @@ class VllmWorkerProcess:
             self.initialized = False
             raise e
     
-    def process_batch(self, batch_data: List[Tuple[str, List[float]]], samples_per_prompt: int = 1):
+    def process_batch(self, batch_data: List[Tuple[str, List[float]]], samples_per_prompt: int = 1, progress_callback=None):
         """处理一个批次的数据"""
         if not self.initialized:
             raise RuntimeError(f"Worker {self.worker_id} not initialized")
         
         try:
             # 使用VllmSampler的generate_batch方法
-            result = self.vllm_sampler.generate_batch(batch_data, samples_per_prompt)
+            result = self.vllm_sampler.generate_batch(batch_data, samples_per_prompt, progress_callback=progress_callback)
             return result
         except Exception as e:
             logger.error(f"Worker {self.worker_id} batch processing failed: {e}")
             raise e
+        
+    def get_tokenizer(self):
+        if not self.tokenizer:
+            self.tokenizer = self.vllm_sampler.get_tokenizer()
+            
+        return self.tokenizer
     
     def get_model_info(self):
         """获取模型信息"""
@@ -94,7 +102,7 @@ class VllmWorkerProcess:
             raise RuntimeError(f"Worker {self.worker_id} not initialized")
         if self.device_id == 1:
             return {
-                'tokenizer': self.vllm_sampler.get_tokenizer(),
+                'tokenizer': self.get_tokenizer(),
                 'hidden_state_size': self.vllm_sampler.get_hidden_state_size(),
                 'num_layers': self.vllm_sampler.get_num_layers()
             }
@@ -164,13 +172,30 @@ def worker_process_main(worker_id: int, device_id: int, llm_kwargs: Dict, sae_kw
                     break
                 
                 # 解析任务类型
-                if len(task) == 3:
+                if len(task) == 2:
+                    task_id, method_name = task
+                    if method_name == 'get_tokenizer':
+                        result = worker.get_tokenizer()
+                        result_queue.put((task_id, result, 0, None))
+
+                elif len(task) == 3:
                     # 生成任务
                     task_id, batch_data, samples_per_prompt = task
                     
                     # 处理批次
                     start_time = time.time()
-                    result = worker.process_batch(batch_data, samples_per_prompt)
+                    
+                    # 创建进度条
+                    total_samples = len(batch_data)
+                    # with tqdm(total=total_samples, desc=f"Worker {worker_id} Processing", 
+                    #          unit="sample", position=worker_id, leave=False) as pbar:
+                    #     # 定义进度回调函数
+                    #     def progress_callback(n):
+                    #         pbar.update(n)
+                    progress_callback=None
+                    # 处理批次并传入回调函数
+                    result = worker.process_batch(batch_data, samples_per_prompt, progress_callback=progress_callback)
+                    
                     processing_time = time.time() - start_time
                     
                     # 发送结果
@@ -195,7 +220,6 @@ def worker_process_main(worker_id: int, device_id: int, llm_kwargs: Dict, sae_kw
                     except Exception as e:
                         processing_time = time.time() - start_time
                         result_queue.put((task_id, None, processing_time, str(e)))
-                
                 else:
                     logger.error(f"Worker {worker_id} received invalid task format: {task}")
                     continue
@@ -440,15 +464,16 @@ class MultiProcessVllmSampler:
         return batches
     
     def generate_parallel(self, prompts: List[str], strengths_list: List[List[float]], 
-                         samples_per_prompt: int = 1, timeout: float = 300.0):
+                         samples_per_prompt: int = 1, timeout: float = 300.0, batch_size: int = 1):
         """
-        并行生成文本
+        并行生成文本 - 动态负载均衡版本
         
         Args:
             prompts: 输入prompt列表
             strengths_list: 对应的strengths列表
             samples_per_prompt: 每个prompt生成的样本数
             timeout: 超时时间（秒）
+            batch_size: 每个任务的批次大小
             
         Returns:
             所有生成的输出列表
@@ -459,42 +484,64 @@ class MultiProcessVllmSampler:
         if len(prompts) == 0:
             return []
         
-        # 分割数据
-        batches = self._split_data(prompts, strengths_list)
+        # 将数据组织成任务列表
+        data = list(zip(prompts, strengths_list))
+        tasks = []
         
-        # 提交任务到各个进程
-        task_ids = []
+        # 按batch_size分组创建任务
+        for i in range(0, len(data), batch_size):
+            batch_data = data[i:i + batch_size]
+            task_id = self.task_counter
+            self.task_counter += 1
+            tasks.append((task_id, batch_data))
+        
+        # 动态任务分配
+        task_queue_index = 0  # 当前要分配的任务索引
         submitted_tasks = 0
-        
-        for i, batch in enumerate(batches):
-            if batch:  # 只处理非空批次
-                task_id = self.task_counter
-                self.task_counter += 1
-                
-                try:
-                    # self.task_queues[i].put((task_id, batch, samples_per_prompt), timeout=5.0)
-                    self.task_queues[i].put((task_id, batch, samples_per_prompt), timeout=None)
-                    task_ids.append(task_id)
-                    submitted_tasks += 1
-                    self.process_usage_count[i] += 1
-                except queue.Full:
-                    logger.warning(f"Task queue {i} is full, skipping batch")
-        
-        if submitted_tasks == 0:
-            return []
+        task_ids = []
+        process_busy = [False] * self.num_processes  # 跟踪进程忙碌状态
+        task_to_process = {}  # 记录任务分配给哪个进程
         
         # 收集结果
         results = {}
         completed_tasks = 0
         start_time = time.time()
         
-        while completed_tasks < submitted_tasks:
-            # if time.time() - start_time > timeout:
-            #     logger.error(f"Generation timeout after {timeout} seconds")
-            #     break
+        logger.info(f"Starting dynamic load balancing for {len(tasks)} tasks across {self.num_processes} processes")
+        
+        while completed_tasks < len(tasks):
+            # 1. 尝试分配新任务给空闲进程
+            if task_queue_index < len(tasks):
+                for process_id in range(self.num_processes):
+                    if not process_busy[process_id] and task_queue_index < len(tasks):
+                        task_id, batch_data = tasks[task_queue_index]
+                        
+                        try:
+                            # 尝试将任务放入进程队列（非阻塞）
+                            self.task_queues[process_id].put_nowait((task_id, batch_data, samples_per_prompt))
+                            
+                            task_ids.append(task_id)
+                            submitted_tasks += 1
+                            process_busy[process_id] = True
+                            task_to_process[task_id] = process_id
+                            self.process_usage_count[process_id] += 1
+                            
+                            logger.debug(f"Assigned task {task_id} to process {process_id} (batch size: {len(batch_data)})")
+                            task_queue_index += 1
+                            
+                        except queue.Full:
+                            # 队列满了，跳过这个进程
+                            continue
             
+            # 2. 检查是否有任务完成
             try:
-                task_id, result, processing_time, error = self.result_queue.get(timeout=1.0)
+                task_id, result, processing_time, error = self.result_queue.get(timeout=0.1)
+                
+                # 标记对应进程为空闲
+                if task_id in task_to_process:
+                    process_id = task_to_process[task_id]
+                    process_busy[process_id] = False
+                    logger.debug(f"Process {process_id} finished task {task_id}, now idle")
                 
                 if error is not None:
                     logger.error(f"Task {task_id} failed: {error}")
@@ -505,21 +552,38 @@ class MultiProcessVllmSampler:
                 
                 completed_tasks += 1
                 
+                # 打印进度
+                if completed_tasks % max(1, len(tasks) // 10) == 0 or completed_tasks == len(tasks):
+                    logger.info(f"Progress: {completed_tasks}/{len(tasks)} tasks completed")
+                    
             except queue.Empty:
+                # 没有完成的任务，继续循环
+                time.sleep(0.01)  # 短暂休眠避免CPU占用过高
                 continue
+            
+            # 3. 超时检查
+            # if time.time() - start_time > timeout:
+            #     logger.error(f"Generation timeout after {timeout} seconds")
+            #     logger.error(f"Completed: {completed_tasks}/{len(tasks)}, Submitted: {submitted_tasks}")
+            #     break
         
         # 按任务ID顺序合并结果
         all_outputs = []
-        for task_id in sorted(task_ids):
+        for task_id, _ in tasks:
             if task_id in results:
                 all_outputs.extend(results[task_id])
+            else:
+                logger.warning(f"Task {task_id} result missing")
         
         self.total_tasks += len(prompts)
+        
+        # 打印负载均衡统计
+        logger.info(f"Load balancing stats: {dict(enumerate(self.process_usage_count))}")
         
         return all_outputs
     
     def generate(self, prompts: List[str], strengths_list: List[List[float]], 
-                samples_per_prompt: int = 1, use_parallel: bool = True, timeout: float = 300.0):
+                samples_per_prompt: int = 1, use_parallel: bool = True, timeout: float = 300.0, batch_size: int = 1):
         """
         生成文本（统一接口）
         
@@ -529,14 +593,31 @@ class MultiProcessVllmSampler:
             samples_per_prompt: 每个prompt生成的样本数
             use_parallel: 是否使用并行（对于多进程版本，这个参数总是True）
             timeout: 超时时间
+            batch_size: 每个任务的批次大小
             
         Returns:
             生成的输出列表
         """
-        return self.generate_parallel(prompts, strengths_list, samples_per_prompt, timeout)
+        return self.generate_parallel(prompts, strengths_list, samples_per_prompt, timeout, batch_size)
     
-    def get_tokenizer(self):
+    def get_tokenizer(self, device=4):
         """获取tokenizer"""
+        # if not self.initialized or self.model_info is None:
+        #     raise RuntimeError("MultiProcessVllmSampler not initialized")
+        # task_id = f"tokenizer_{time.time()}"
+        # task = (task_id, 'get_tokenizer')
+        # self.task_queues[device-1].put(task, timeout=10.0)
+        # # 等待结果
+        # start_time = time.time()
+        # while True:
+        #     try:
+        #         result_task_id, result, processing_time, error = self.result_queue.get(timeout=1.0)
+        #         if result_task_id == task_id:
+        #             if error:
+        #                 raise RuntimeError(f"Worker process error: {error}")
+        #             return result
+        #     except queue.Empty:
+        #         continue
         if not self.initialized or self.model_info is None:
             raise RuntimeError("MultiProcessVllmSampler not initialized")
         return self.model_info['tokenizer']
@@ -578,8 +659,6 @@ class MultiProcessVllmSampler:
                 except queue.Empty:
                     continue
             
-            raise TimeoutError("get_last_token_hidden_state timeout")
-            
         except Exception as e:
             logger.error(f"get_last_token_hidden_state failed: {e}")
             raise e
@@ -617,16 +696,39 @@ class MultiProcessVllmSampler:
     
     def get_performance_stats(self) -> Dict[str, Any]:
         """获取性能统计信息"""
+        if not self.initialized:
+            raise RuntimeError("MultiProcessVllmSampler not initialized")
+        
         if self.total_tasks == 0:
-            return {}
+            return {
+                'total_tasks': 0,
+                'total_processing_time': 0.0,
+                'avg_processing_time': 0.0,
+                'process_usage_count': self.process_usage_count.copy(),
+                'gpu_devices': self.gpu_devices.copy(),
+                'load_balance_ratio': [0.0] * self.num_processes,
+                'load_variance': 0.0,
+                'num_processes': self.num_processes
+            }
+        
+        avg_processing_time = self.total_processing_time / self.total_tasks
+        
+        # 计算负载均衡指标
+        total_usage = sum(self.process_usage_count)
+        load_balance_ratio = [count / max(total_usage, 1) for count in self.process_usage_count]
+        ideal_ratio = 1.0 / self.num_processes
+        load_variance = sum((ratio - ideal_ratio)**2 for ratio in load_balance_ratio) / self.num_processes
         
         return {
             'total_tasks': self.total_tasks,
             'total_processing_time': self.total_processing_time,
-            'avg_processing_time': self.total_processing_time / self.total_tasks,
-            'process_usage_count': self.process_usage_count,
-            'process_usage_ratio': [count / sum(self.process_usage_count) if sum(self.process_usage_count) > 0 else 0 
-                                  for count in self.process_usage_count]
+            'avg_processing_time': avg_processing_time,
+            'process_usage_count': self.process_usage_count.copy(),
+            'gpu_devices': self.gpu_devices.copy(),
+            'process_usage_ratio': load_balance_ratio,
+            'load_balance_ratio': load_balance_ratio,
+            'load_variance': load_variance,  # 越小表示负载越均衡
+            'num_processes': self.num_processes
         }
     
     def shutdown(self, timeout: float = 30.0):

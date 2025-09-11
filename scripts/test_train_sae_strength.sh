@@ -26,7 +26,7 @@ train_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
 test_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
 
 model="/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-num_instances=4
+num_instances=1
 sae_release=andreuka18/deepseek-r1-distill-llama-8b-lmsys-openthoughts
 sae_id=blocks.19.hook_resid_post
 save_dir="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B"

@@ -31,9 +31,9 @@ def reward_func(responses: list[str], prompts: list[str], labels: list[str])->to
             # print(f"resp: {extracted_answers[0][0]}; gt: {extracted_answers[1][0]}; is_true: {is_true}")
         except:
             # print(f"Error verifying answers: {e}")
-            print("="*20+"reward error"+"="*20)
-            print(response)
-            print(label)
+            # print("="*20+"reward error"+"="*20)
+            # print(response)
+            # print(label)
             is_true = False
         reward = 1.0 if is_true else 0.0
 

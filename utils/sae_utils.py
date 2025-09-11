@@ -175,6 +175,67 @@ def get_multi_intervention_hook(
 
     return hook_fn
 
+def get_multi_intervention_hook_batch(
+    sae: SAE,
+    feature_idxs: list[int],
+    max_activations: list[float],
+    strengths: list[list[float]],
+    seq_lens: list[int]
+):
+    strengths_tensor = torch.tensor(strengths)
+    max_activations_tensor = torch.tensor(max_activations)
+    def hook_fn(module, input, output):
+        nonlocal strengths_tensor, max_activations_tensor
+        if not GlobalSAE.use_sae:
+            return output
+
+        if torch.is_tensor(output):
+            activations = output.clone()
+        else:
+            activations = output[0].clone()
+        
+        is_prompt_input = False
+        if activations.shape[0] != strengths_tensor.shape[0]:
+            is_prompt_input = True
+
+        if sae.device != activations.device:
+            sae.device = activations.device
+            sae.to(sae.device)
+            strengths_tensor = strengths_tensor.to(activations.device)
+            max_activations_tensor = max_activations_tensor.to(activations.device)
+
+        features = sae.encode(activations)
+        reconstructed = sae.decode(features)
+        error = activations.to(features.dtype) - reconstructed
+
+        target_values = strengths_tensor * max_activations_tensor
+        # 逐 batch 写入指定 feature_idx
+        for j, feature_idx in enumerate(feature_idxs):
+            if is_prompt_input:
+                offset = 0
+                for bs_i in range(strengths_tensor.shape[0]):
+                    features[offset:offset+seq_lens[bs_i], feature_idx] = target_values[bs_i, j]
+                    offset += seq_lens[bs_i]
+            else:
+                features[:, feature_idx] = target_values[:, j]
+
+        # for feature_idx, max_activation, strength in zip(feature_idxs, max_activations, strengths):
+        #     features[..., feature_idx] = max_activation * strength
+        # for j, feature_idx in enumerate(feature_idxs):
+        #     target_value = strengths_tensor[:, j] * max_activations_tensor[j]  # (B,)
+        #     # broadcast 到 (B, T)
+        #     features[..., feature_idx] = target_value.unsqueeze(1).expand(-1, features.size(1))
+
+        activations_hat = sae.decode(features) + error
+        activations_hat = activations_hat.type_as(activations)
+
+        if torch.is_tensor(output):
+            return activations_hat
+        else:
+            return (activations_hat,) + output[1:] if len(output) > 1 else (activations_hat,)
+
+    return hook_fn
+
 def get_clamp_hook(
     direction: Tensor,
     max_activation: float = 1.0,

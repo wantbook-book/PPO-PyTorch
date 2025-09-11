@@ -17,7 +17,7 @@ SAE强度预测器训练脚本 - 重构版本
 - StrengthTrainer: 主训练类
 """
 
-from models.vllm_sampler import VllmSampler, MultiVllmSampler
+from models.vllm_sampler import VllmSampler
 from models.multiprocess_vllm_sampler import MultiProcessVllmSampler 
 from models.strengths_predictor import StrengthsPredictor
 import torch
@@ -373,24 +373,33 @@ class StrengthTrainer:
                             sae_logprobs: torch.Tensor, all_logprobs_tensor: torch.Tensor,
                             resp_lens: List[float]) -> Dict[str, Any]:
         """计算批次指标"""
-        
+        metrics_start_time = time.time()
         
         # 计算rewards
+        rewards_start_time = time.time()
         rewards = reward_func(responses, repeated_prompts, repeated_answers)
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards)
         rewards = rewards.to('cpu')
+        rewards_time = time.time() - rewards_start_time
+        print(f"[TIMING] 计算rewards用时: {rewards_time:.4f}s")
         
         # 计算reference logprobs
+        ref_logprobs_start_time = time.time()
         ref_logprobs = self.vllm_sampler.get_logprobs(sequences, attention_masks)
         ref_logprobs = ref_logprobs.to('cpu')
         ref_logprobs = ref_logprobs[:, :-1]
         ref_logprobs = ref_logprobs[:, -action_masks.shape[1]:] * action_masks.float()
+        ref_logprobs_time = time.time() - ref_logprobs_start_time
+        print(f"[TIMING] 计算reference logprobs用时: {ref_logprobs_time:.4f}s")
         
         # 计算KL penalty
+        kl_penalty_start_time = time.time()
         sae_logprobs = sae_logprobs.to('cpu')
         kl_penalty = compute_approx_kl(sae_logprobs, ref_logprobs)
         batch_kl_penalty = torch.mean(kl_penalty).item()
+        kl_penalty_time = time.time() - kl_penalty_start_time
+        print(f"[TIMING] 计算KL penalty用时: {kl_penalty_time:.4f}s")
         
         # 删除不再需要的tensor
         del ref_logprobs
@@ -398,9 +407,12 @@ class StrengthTrainer:
             torch.cuda.empty_cache()
         
         # 计算序列熵
+        entropy_start_time = time.time()
         response_logprobs = all_logprobs_tensor[:, -action_masks.shape[1]:, :].to('cpu')
         sequence_entropies = compute_entropy(response_logprobs, action_masks, temperature=self.config.temperature)
         avg_sequence_entropy = torch.mean(sequence_entropies).item()
+        entropy_time = time.time() - entropy_start_time
+        print(f"[TIMING] 计算序列熵用时: {entropy_time:.4f}s")
         
         # 删除大型tensor
         del response_logprobs
@@ -408,17 +420,23 @@ class StrengthTrainer:
             torch.cuda.empty_cache()
         
         # 计算token级别rewards
+        token_rewards_start_time = time.time()
         # (N, n_sampler_per_prompt, seq_len)
         # (N, n_sampler_per_prompt, 1)
         token_level_rewards = compute_reward(
             rewards, self.config.kl_coef, kl_penalty,
             action_mask=action_masks, reward_clip_range=self.config.reward_clip_range,
         )
+        token_rewards_time = time.time() - token_rewards_start_time
+        print(f"[TIMING] 计算token级别rewards用时: {token_rewards_time:.4f}s")
         
         # 计算advantages
+        advantages_start_time = time.time()
         advantages, returns = compute_reinforce_plus_plus_baseline_outcome_advantage(
             token_level_rewards, action_masks, index
         )
+        advantages_time = time.time() - advantages_start_time
+        print(f"[TIMING] 计算advantages用时: {advantages_time:.4f}s")
         
         # 保存需要返回的值
         batch_rewards_value = torch.mean(rewards).item()
@@ -427,6 +445,10 @@ class StrengthTrainer:
         del returns
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # 计算总用时
+        total_metrics_time = time.time() - metrics_start_time
+        print(f"[TIMING] compute_batch_metrics总用时: {total_metrics_time:.4f}s")
         
         return {
             'rewards': rewards,
@@ -444,11 +466,14 @@ class StrengthTrainer:
     
     def train_step(self, batch) -> Dict[str, float]:
         """执行一个训练步骤"""
+        step_start_time = time.time()
+        
         self.strength_predictor.train()
         prompts = batch['problem']
         answers = batch['answer']
         
         # 准备重复的prompts和answers
+        prep_start_time = time.time()
         repeated_prompts = []
         repeated_answers = []
         index = []
@@ -457,33 +482,50 @@ class StrengthTrainer:
                 index.append(i)
                 repeated_prompts.append(prompts[i])
                 repeated_answers.append(answers[i])
+        prep_time = time.time() - prep_start_time
+        print(f"[TIMING] 数据准备用时: {prep_time:.4f}s")
 
         # 获取hidden states
+        hidden_start_time = time.time()
         hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
         repeated_hidden_states = hidden_states.repeat_interleave(self.config.n_samples_per_prompt, dim=0)
         # hidden_states = hidden_states.to(self.model_manager.predictor_device)
         repeated_hidden_states = repeated_hidden_states.to(self.model_manager.predictor_device)
+        hidden_time = time.time() - hidden_start_time
+        print(f"[TIMING] 获取hidden states用时: {hidden_time:.4f}s")
 
         # 预测strengths
+        predict_start_time = time.time()
         # (N, num_feature)
         predicted_strengths = self.strength_predictor(repeated_hidden_states)
         strengths_values = predicted_strengths.detach().cpu().numpy()
+        predict_time = time.time() - predict_start_time
+        print(f"[TIMING] 预测strengths用时: {predict_time:.4f}s")
         
         # 生成输出
+        generate_start_time = time.time()
         outputs = self.vllm_sampler.generate(
-            repeated_prompts, strengths_values.tolist(), 1
+            repeated_prompts, strengths_values.tolist(), 1, batch_size=4
         )
+        generate_time = time.time() - generate_start_time
+        print(f"[TIMING] 生成输出用时: {generate_time:.4f}s")
         
         # 处理批次输出
+        process_start_time = time.time()
         (sequences, attention_masks, action_masks, responses, resp_lens, 
          sae_logprobs, all_logprobs_tensor) = self.batch_processor.process_batch_outputs(outputs)
+        process_time = time.time() - process_start_time
+        print(f"[TIMING] 处理批次输出用时: {process_time:.4f}s")
         
         # 计算指标
+        metrics_start_time = time.time()
         metrics = self.compute_batch_metrics(
             sequences, attention_masks, action_masks, responses, 
             repeated_prompts, repeated_answers, index,
             sae_logprobs, all_logprobs_tensor, resp_lens
         )
+        metrics_time = time.time() - metrics_start_time
+        print(f"[TIMING] 计算指标用时: {metrics_time:.4f}s")
         
         # 显式删除大型tensor以释放显存
         del sequences, attention_masks, sae_logprobs, all_logprobs_tensor
@@ -491,6 +533,7 @@ class StrengthTrainer:
             torch.cuda.empty_cache()
         
         # 计算损失
+        loss_start_time = time.time()
         advantages = metrics['advantages'][:, :self.feature_num]
         advantages = advantages.to(self.model_manager.predictor_device)
         
@@ -514,8 +557,11 @@ class StrengthTrainer:
             clip_ratio_c=self.config.clip_ratio_c,
             loss_agg_mode=self.config.loss_agg_mode,
         )
+        loss_time = time.time() - loss_start_time
+        print(f"[TIMING] 计算损失用时: {loss_time:.4f}s")
         
         # 反向传播
+        backward_start_time = time.time()
         self.optimizer.zero_grad()
         pg_loss.backward()
         
@@ -528,6 +574,8 @@ class StrengthTrainer:
         grad_norm = total_norm ** (1. / 2)
         
         self.optimizer.step()
+        backward_time = time.time() - backward_start_time
+        print(f"[TIMING] 反向传播用时: {backward_time:.4f}s")
         
         # 保存loss值用于返回
         policy_loss_value = pg_loss.item()
@@ -539,6 +587,12 @@ class StrengthTrainer:
         del pg_loss
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # 计算总用时
+        total_time = time.time() - step_start_time
+        print(f"[TIMING] 总训练步骤用时: {total_time:.4f}s")
+        print(f"[TIMING] ========================================")
+        
         return {
             'policy_loss': policy_loss_value,
             'kl_penalty': metrics['batch_kl_penalty'],
@@ -678,6 +732,9 @@ class StrengthTrainer:
                 # 保存模型
                 if global_step % self.config.save_interval == 0:
                     self.save_model(global_step)
+                
+                # log出一步的信息
+                print(f"Epoch {epoch+1}, Step {global_step}, Loss: {step_metrics['policy_loss']:.4f}, Rewards: {step_metrics['rewards_mean']:.4f}, Advantages: {step_metrics['advantages_mean']:.4f}")
             
             # 记录epoch统计
             epoch_duration = time.time() - epoch_start_time

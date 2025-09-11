@@ -1,6 +1,6 @@
 from vllm import LLM, SamplingParams
 from sae_lens import SAE
-from utils.sae_utils import add_hooks, get_multi_intervention_hook
+from utils.sae_utils import add_hooks, get_multi_intervention_hook, get_multi_intervention_hook_batch
 import torch
 from functools import partial
 from transformers import AutoModelForCausalLM
@@ -10,9 +10,17 @@ import threading
 from typing import List, Tuple
 import copy
 import os
+import time
+from tqdm import tqdm
+import logging
+import functools
+
+# 设置日志
+logger = logging.getLogger(__name__)
 class VllmSampler:
     def __init__(self, llm_kwargs, sae_kwargs, sampling_kwargs, device="1") -> None:
         self.llm = LLM(**llm_kwargs)
+        self.device = device
         if device == "1":
             self.model = AutoModelForCausalLM.from_pretrained(
                 llm_kwargs["model"],
@@ -33,45 +41,148 @@ class VllmSampler:
             self.sae = None
         if self.sae:
             self.lm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            
+            # 确保SAE模型移动到正确的设备
+            # self.sae = self.sae.to("cuda:0")
+            
             feature_idxs = sae_kwargs.get("feature_idxs")
             feature_idxs = list(map(int, feature_idxs.split(',')))
             max_activations = sae_kwargs.get("max_activations")
             max_activations = list(map(float, max_activations.split(',')))
             # strengths 需要运行时确定，先用用一个partial得到函数
-            self.get_multi_intervention_hook_with_strengths = partial(get_multi_intervention_hook, sae=self.sae, feature_idxs=feature_idxs, max_activations=max_activations)
+            self.get_multi_intervention_hook_with_strengths = partial(get_multi_intervention_hook_batch, sae=self.sae, feature_idxs=feature_idxs, max_activations=max_activations)
+            # self.get_multi_intervention_hook_with_strengths = partial(get_multi_intervention_hook, sae=self.sae, feature_idxs=feature_idxs, max_activations=max_activations)
         else:
             self.get_multi_intervention_hook_with_strengths = None
         
     def generate(self, prompts: list[str], strengths_list: list[list[float]], samples_per_prompt: int=1):
         outputs = []
-        for prompt, strengths in zip(prompts, strengths_list):
-            sae_hooks = []
-            if self.sae:
-                sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths)))
-            with add_hooks([], sae_hooks):
-                output = self.llm.generate(
-                    [prompt]*samples_per_prompt,  # vLLM的generate方法期望接收一个列表，即使只有一个prompt
-                    self.sampling_params,
-                    use_tqdm=False
-                )
-            outputs.extend(output)  # 使用extend而不是append，因为output本身就是一个列表
+        # for prompt, strengths in zip(prompts, strengths_list):
+        sae_hooks = []
+        if self.sae:
+            sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths_list)))
+        with add_hooks([], sae_hooks):
+            output = self.llm.generate(
+                # [prompt]*samples_per_prompt,  # vLLM的generate方法期望接收一个列表，即使只有一个prompt
+                prompts,
+                self.sampling_params,
+                use_tqdm=False
+            )
+        outputs.extend(output)  # 使用extend而不是append，因为output本身就是一个列表
+        return outputs
+
+    def generate_batch(self, batch_data: List[Tuple[str, List[float]]], samples_per_prompt: int=1, max_workers: int=None, progress_callback=None):
+        strengths_list = []
+        prompts = []
+        prompt_lens = []
+        for prompt, strengths in batch_data:
+            prompts.append(prompt)
+            strengths_list.append(strengths)
+            prompt_lens.append(len(self.tokenizer.encode(prompt)))
+        sae_hooks = []
+        if self.sae:
+            sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths_list, seq_lens=prompt_lens)))
+        start = time.time()
+        with add_hooks([], sae_hooks):
+            outputs = self.llm.generate(
+                prompts,
+                self.sampling_params,
+                use_tqdm=functools.partial(tqdm, desc=f"Device {self.device} Processed prompts")
+            )
+        if progress_callback:
+            progress_callback(len(outputs))
+        end = time.time()
+        token_count = sum([len(output.outputs[0].token_ids) for output in outputs])
+        print(f"Device: {self.device}, Generation time: {end-start:.1f} seconds, Token count: {token_count}, Speed: {token_count/(end-start):.1f} tps")
+        
         return outputs
     
-    def generate_batch(self, batch_data: List[Tuple[str, List[float]]], samples_per_prompt: int=1):
-        """批量处理一组prompt和strengths的组合"""
-        outputs = []
-        for prompt, strengths in batch_data:
-            sae_hooks = []
-            if self.sae:
-                sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths)))
-            with add_hooks([], sae_hooks):
-                output = self.llm.generate(
-                    [prompt]*samples_per_prompt,
-                    self.sampling_params,
-                    use_tqdm=False
-                )
-            outputs.extend(output)
-        return outputs
+    # def generate_batch(self, batch_data: List[Tuple[str, List[float]]], samples_per_prompt: int=1, max_workers: int=None, progress_callback=None):
+    #     """批量处理一组prompt和strengths的组合，使用多线程并发处理"""
+    #     if not batch_data:
+    #         return []
+            
+    #     # 如果只有一个样本，直接处理不使用多线程
+    #     if len(batch_data) == 1:
+    #         prompt, strengths = batch_data[0]
+    #         sae_hooks = []
+    #         if self.sae:
+    #             sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths)))
+    #         start = time.time()
+    #         with add_hooks([], sae_hooks):
+    #             output = self.llm.generate(
+    #                 [prompt]*samples_per_prompt,
+    #                 self.sampling_params,
+    #                 use_tqdm=False
+    #             )
+    #         elapsed_time = time.time() - start
+    #         token_count = sum([len(output.outputs[0].token_ids) for output in output])
+    #         print(f"Device: {self.device}, Generation time: {elapsed_time:.1f} seconds, Token count: {token_count}, Speed: {token_count/elapsed_time:.1f} tps")
+    #         if progress_callback:
+    #             progress_callback(1)
+    #         return output
+        
+    #     # 确定工作线程数量，默认为CPU核心数或样本数的较小值
+    #     if max_workers is None:
+    #         max_workers = min(os.cpu_count() or 4, len(batch_data))
+    #         max_workers = 1
+        
+    #     # 定义单个样本的处理函数
+    #     def process_single_sample(sample_data):
+    #         prompt, strengths = sample_data
+    #         sae_hooks = []
+    #         if self.sae:
+    #             sae_hooks.append((self.lm_model.model.layers[self.sae.cfg.hook_layer], self.get_multi_intervention_hook_with_strengths(strengths=strengths)))
+    #         start = time.time()
+    #         try:
+    #             with add_hooks([], sae_hooks):
+    #                 output = self.llm.generate(
+    #                     [prompt]*samples_per_prompt,
+    #                     self.sampling_params,
+    #                     use_tqdm=False
+    #                 )
+    #             elapsed_time = time.time() - start
+    #             print(f"Device: {self.device}, Sample processed in {elapsed_time:.4f} seconds")
+    #             return output
+    #         except Exception as e:
+    #             logger.error(f"Error processing sample on device {self.device}: {str(e)}")
+    #             return []
+        
+    #     # 使用线程池并行处理所有样本
+    #     start_total = time.time()
+        
+    #     # 创建一个与batch_data长度相同的结果列表，用于保持顺序
+    #     results_by_idx = [None] * len(batch_data)
+        
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    #         # 提交所有任务
+    #         future_to_sample = {executor.submit(process_single_sample, sample): i for i, sample in enumerate(batch_data)}
+            
+    #         # 使用进度条收集结果（按原始顺序存储）
+    #         with tqdm(total=len(batch_data), desc=f"Processing batch on {self.device}", unit="sample") as pbar:
+    #             for future in concurrent.futures.as_completed(future_to_sample):
+    #                 sample_idx = future_to_sample[future]
+    #                 try:
+    #                     result = future.result()
+    #                     results_by_idx[sample_idx] = result
+    #                 except Exception as e:
+    #                     logger.error(f"Sample {sample_idx} generated an exception: {str(e)}")
+    #                     results_by_idx[sample_idx] = []
+                    
+    #                 # 更新进度条
+    #                 pbar.update(1)
+    #                 if progress_callback:
+    #                     progress_callback(1)
+        
+    #     # 按原始顺序合并结果
+    #     all_outputs = []
+    #     for result in results_by_idx:
+    #         if result is not None:
+    #             all_outputs.extend(result)
+        
+    #     elapsed_total = time.time() - start_total
+    #     print(f"Device: {self.device}, Total batch processing time: {elapsed_total:.4f} seconds")
+    #     return all_outputs
 
     def get_last_token_hidden_state(self, prompts: list[str], batch_size: int=8)->torch.Tensor:
         """
@@ -208,144 +319,3 @@ class VllmSampler:
     def get_tokenizer(self):
         return self.tokenizer
 
-
-class MultiVllmSampler:
-    """多实例并行处理的VllmSampler管理器"""
-    
-    def __init__(self, llm_kwargs, sae_kwargs, sampling_kwargs, num_instances: int = 2, max_workers: int = None):
-        """
-        Args:
-            llm_kwargs: LLM初始化参数
-            sae_kwargs: SAE初始化参数
-            sampling_kwargs: 采样参数
-            num_instances: VllmSampler实例数量
-            max_workers: 最大并行工作线程数，默认为num_instances
-        """
-        self.num_instances = num_instances
-        self.max_workers = max_workers or num_instances
-        self.lock = threading.Lock()
-        
-        # 为每个实例分配不同的GPU设备（如果有多个GPU）
-        self.samplers = []
-        for i in range(num_instances):
-            # 复制参数以避免修改原始参数
-            instance_llm_kwargs = copy.deepcopy(llm_kwargs)
-            instance_sae_kwargs = copy.deepcopy(sae_kwargs)
-            instance_sampling_kwargs = copy.deepcopy(sampling_kwargs)
-            
-            # 如果有多个GPU，可以分配不同的设备
-            # if torch.cuda.device_count() > 1:
-            #     device_id = i % torch.cuda.device_count()
-                # 注意：vLLM的设备分配可能需要特殊处理
-                # 这里只是示例，实际使用时可能需要调整
-                # if 'tensor_parallel_size' not in instance_llm_kwargs:
-                #     instance_llm_kwargs['tensor_parallel_size'] = 1
-            sampler = VllmSampler(instance_llm_kwargs, instance_sae_kwargs, instance_sampling_kwargs, device=str(1+i))
-            self.samplers.append(sampler)
-    
-    def _split_data(self, prompts: List[str], strengths_list: List[List[float]]) -> List[List[Tuple[str, List[float]]]]:
-        """将数据分割成多个批次，分配给不同的实例"""
-        data = list(zip(prompts, strengths_list))
-        batch_size = len(data) // self.num_instances
-        remainder = len(data) % self.num_instances
-        
-        batches = []
-        start_idx = 0
-        
-        for i in range(self.num_instances):
-            # 为前remainder个批次多分配一个样本
-            current_batch_size = batch_size + (1 if i < remainder else 0)
-            end_idx = start_idx + current_batch_size
-            
-            if start_idx < len(data):
-                batches.append(data[start_idx:end_idx])
-            else:
-                batches.append([])
-            
-            start_idx = end_idx
-        
-        return batches
-    
-    def generate_parallel(self, prompts: List[str], strengths_list: List[List[float]], samples_per_prompt: int = 1):
-        """
-        并行生成文本
-        
-        Args:
-            prompts: 输入prompt列表
-            strengths_list: 对应的strengths列表
-            samples_per_prompt: 每个prompt生成的样本数
-            
-        Returns:
-            所有生成的输出列表
-        """
-        if len(prompts) == 0:
-            return []
-        
-        # 将数据分割成批次
-        batches = self._split_data(prompts, strengths_list)
-        
-        # 使用线程池并行处理
-        all_outputs = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交任务
-            future_to_batch = {}
-            for i, batch in enumerate(batches):
-                if batch:  # 只处理非空批次
-                    sampler = self.samplers[i]
-                    future = executor.submit(sampler.generate_batch, batch, samples_per_prompt)
-                    future_to_batch[future] = i
-            
-            # 收集结果
-            batch_results = [None] * len(batches)
-            for future in concurrent.futures.as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
-                try:
-                    result = future.result()
-                    batch_results[batch_idx] = result
-                except Exception as exc:
-                    print(f'Batch {batch_idx} generated an exception: {exc}')
-                    batch_results[batch_idx] = []
-            
-            # 按原始顺序合并结果
-            for result in batch_results:
-                if result is not None:
-                    all_outputs.extend(result)
-        
-        return all_outputs
-    
-    def generate(self, prompts: List[str], strengths_list: List[List[float]], samples_per_prompt: int = 1, use_parallel: bool = True):
-        """
-        生成文本的统一接口
-        
-        Args:
-            prompts: 输入prompt列表
-            strengths_list: 对应的strengths列表
-            samples_per_prompt: 每个prompt生成的样本数
-            use_parallel: 是否使用并行处理
-            
-        Returns:
-            所有生成的输出列表
-        """
-        if use_parallel and len(prompts) > 1:
-            return self.generate_parallel(prompts, strengths_list, samples_per_prompt)
-        else:
-            # 对于单个prompt或不使用并行时，使用第一个sampler
-            return self.samplers[0].generate(prompts, strengths_list, samples_per_prompt)
-    
-    def get_tokenizer(self):
-        """获取tokenizer"""
-        return self.samplers[0].get_tokenizer()
-    
-    def get_hidden_state_size(self) -> int:
-        """获取hidden state大小"""
-        return self.samplers[0].get_hidden_state_size()
-    
-    def get_num_layers(self) -> int:
-        """获取层数"""
-        return self.samplers[0].get_num_layers()
-
-    def get_last_token_hidden_state(self, prompts: list[str], batch_size: int=8)->torch.Tensor:
-        return self.samplers[0].get_last_token_hidden_state(prompts, batch_size)
-
-    def get_logprobs(self, sequences: torch.Tensor, attention_masks: torch.Tensor, temperature: float=1.0, batch_size: int=4)->torch.Tensor:
-        return self.samplers[0].get_logprobs(sequences, attention_masks, temperature, batch_size)
