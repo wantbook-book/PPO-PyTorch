@@ -471,14 +471,14 @@ class MultiProcessVllmSampler:
     def generate_parallel(self, prompts: List[str], strengths_list: List[List[float]], 
                          samples_per_prompt: int = 1, timeout: float = 300.0, batch_size: int = 1):
         """
-        并行生成文本 - 动态负载均衡版本
+        并行生成文本 - 平均分配版本
         
         Args:
             prompts: 输入prompt列表
             strengths_list: 对应的strengths列表
             samples_per_prompt: 每个prompt生成的样本数
             timeout: 超时时间（秒）
-            batch_size: 每个任务的批次大小
+            batch_size: 每个任务的批次大小（在平均分配模式下此参数被忽略）
             
         Returns:
             所有生成的输出列表
@@ -489,64 +489,49 @@ class MultiProcessVllmSampler:
         if len(prompts) == 0:
             return []
         
-        # 将数据组织成任务列表
-        data = list(zip(prompts, strengths_list))
-        tasks = []
+        # 使用平均分配策略将数据分配给各个进程
+        process_batches = self._split_data(prompts, strengths_list)
         
-        # 按batch_size分组创建任务
-        for i in range(0, len(data), batch_size):
-            batch_data = data[i:i + batch_size]
-            task_id = self.task_counter
-            self.task_counter += 1
-            tasks.append((task_id, batch_data))
-        
-        # 动态任务分配
-        task_queue_index = 0  # 当前要分配的任务索引
-        submitted_tasks = 0
+        # 为每个进程分配任务
         task_ids = []
-        process_busy = [False] * self.num_processes  # 跟踪进程忙碌状态
-        task_to_process = {}  # 记录任务分配给哪个进程
+        process_task_mapping = {}  # 记录进程对应的任务ID
+        
+        start_time = time.time()
+        
+        logger.info(f"Starting even distribution for {len(prompts)} prompts across {self.num_processes} processes")
+        
+        # 分配任务给各个进程
+        for process_id, batch_data in enumerate(process_batches):
+            if len(batch_data) > 0:  # 只为有数据的进程分配任务
+                task_id = self.task_counter
+                self.task_counter += 1
+                task_ids.append(task_id)
+                process_task_mapping[task_id] = process_id
+                
+                try:
+                    # 将任务放入对应进程的队列
+                    self.task_queues[process_id].put((task_id, batch_data, samples_per_prompt), timeout=timeout)
+                    self.process_usage_count[process_id] += 1
+                    
+                    logger.info(f"Assigned {len(batch_data)} prompts to process {process_id} (task {task_id})")
+                    
+                except queue.Full:
+                    logger.error(f"Process {process_id} queue is full, skipping task {task_id}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Failed to assign task {task_id} to process {process_id}: {e}")
+                    continue
         
         # 收集结果
         results = {}
         completed_tasks = 0
-        start_time = time.time()
+        expected_tasks = len(task_ids)
         
-        logger.info(f"Starting dynamic load balancing for {len(tasks)} tasks across {self.num_processes} processes")
+        logger.info(f"Waiting for {expected_tasks} tasks to complete")
         
-        while completed_tasks < len(tasks):
-            # 1. 尝试分配新任务给空闲进程
-            if task_queue_index < len(tasks):
-                for process_id in range(self.num_processes):
-                    if not process_busy[process_id] and task_queue_index < len(tasks):
-                        task_id, batch_data = tasks[task_queue_index]
-                        
-                        try:
-                            # 尝试将任务放入进程队列（非阻塞）
-                            self.task_queues[process_id].put_nowait((task_id, batch_data, samples_per_prompt))
-                            
-                            task_ids.append(task_id)
-                            submitted_tasks += 1
-                            process_busy[process_id] = True
-                            task_to_process[task_id] = process_id
-                            self.process_usage_count[process_id] += 1
-                            
-                            logger.debug(f"Assigned task {task_id} to process {process_id} (batch size: {len(batch_data)})")
-                            task_queue_index += 1
-                            
-                        except queue.Full:
-                            # 队列满了，跳过这个进程
-                            continue
-            
-            # 2. 检查是否有任务完成
+        while completed_tasks < expected_tasks:
             try:
-                task_id, result, processing_time, error = self.result_queue.get(timeout=0.1)
-                
-                # 标记对应进程为空闲
-                if task_id in task_to_process:
-                    process_id = task_to_process[task_id]
-                    process_busy[process_id] = False
-                    logger.debug(f"Process {process_id} finished task {task_id}, now idle")
+                task_id, result, processing_time, error = self.result_queue.get(timeout=timeout)
                 
                 if error is not None:
                     logger.error(f"Task {task_id} failed: {error}")
@@ -554,27 +539,28 @@ class MultiProcessVllmSampler:
                 else:
                     results[task_id] = result
                     self.total_processing_time += processing_time
+                    
+                    if task_id in process_task_mapping:
+                        process_id = process_task_mapping[task_id]
+                        logger.debug(f"Process {process_id} completed task {task_id} with {len(result)} outputs")
                 
                 completed_tasks += 1
                 
                 # 打印进度
-                if completed_tasks % max(1, len(tasks) // 10) == 0 or completed_tasks == len(tasks):
-                    logger.info(f"Progress: {completed_tasks}/{len(tasks)} tasks completed")
+                if completed_tasks % max(1, expected_tasks // 10) == 0 or completed_tasks == expected_tasks:
+                    logger.info(f"Progress: {completed_tasks}/{expected_tasks} tasks completed")
                     
             except queue.Empty:
-                # 没有完成的任务，继续循环
-                time.sleep(0.01)  # 短暂休眠避免CPU占用过高
-                continue
-            
-            # 3. 超时检查
-            # if time.time() - start_time > timeout:
-            #     logger.error(f"Generation timeout after {timeout} seconds")
-            #     logger.error(f"Completed: {completed_tasks}/{len(tasks)}, Submitted: {submitted_tasks}")
-            #     break
+                logger.error(f"Timeout waiting for task results after {timeout} seconds")
+                logger.error(f"Completed: {completed_tasks}/{expected_tasks}")
+                break
+            except Exception as e:
+                logger.error(f"Error while collecting results: {e}")
+                break
         
-        # 按任务ID顺序合并结果
+        # 按进程顺序合并结果，保持原始顺序
         all_outputs = []
-        for task_id, _ in tasks:
+        for task_id in task_ids:
             if task_id in results:
                 all_outputs.extend(results[task_id])
             else:
@@ -582,8 +568,13 @@ class MultiProcessVllmSampler:
         
         self.total_tasks += len(prompts)
         
-        # 打印负载均衡统计
-        logger.info(f"Load balancing stats: {dict(enumerate(self.process_usage_count))}")
+        # 打印分配统计
+        distribution_stats = {}
+        for process_id, batch_data in enumerate(process_batches):
+            distribution_stats[process_id] = len(batch_data)
+        
+        logger.info(f"Even distribution stats: {distribution_stats}")
+        logger.info(f"Total processing time: {self.total_processing_time:.2f}s")
         
         return all_outputs
     

@@ -1,5 +1,9 @@
 {
   "idx": 0,
   "problem": "A scientist is designing a filter for a signal processing application. They want to minimize phase distortion in the passband and ensure strong attenuation in the stopband. Considering the general behavior of phase angle between input voltage \\( V_{in} \\) and output voltage \\( V_{out} \\) across various filter orders, which statement best characterizes the phase shift in the passband and stopband for typical electronic filters?\n\nA) Phase shift approaches \\( 90^\\circ \\) in both the passband and stopband, irrespective of filter order.\nB) Phase shift is maximized (large value) in the passband and minimized (close to zero) in the stopband for all filters.\nC) Phase shift is close to zero in the passband, and approaches \\( \\pm90^\\circ \\) in the stopband, regardless of filter order.\nD) Phase shift is always negative in the passband and always positive in the stopband due to reactive components.",
-  "answer": "\\boxed{C}"
+  "answer": "\\boxed{C}",
+  "data_source": "gpqa_rubric",
+  "ability": "science",
+  "subject": "Science",
+  "level": 4
 }

@@ -19,14 +19,21 @@ kl_coef=0
 vocab_size=128256
 logprobs=20
 
-train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/scp116k/train.jsonl"
-# train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/math/train_with_idx.jsonl"
-test_data_path="/angel/fwk/code/PPO-PyTorch/dataset/gpqa_diamond/test.jsonl"
-train_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
-test_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
+# train_data_path="/angel/fwk/code/PPO-PyTorch/dataset/scp116k/train.jsonl"
+# test_data_path="/angel/fwk/code/PPO-PyTorch/dataset/gpqa_diamond/test.jsonl"
+# train_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
+# test_prompt_path="/angel/fwk/code/PPO-PyTorch/prompts/multichoice.txt"
+proj_path="/pubshare/fwk/code/sae/PPO-PyTorch"
+train_data_path="${proj_path}/dataset/scp116k/train.jsonl"
+test_data_path="${proj_path}/dataset/gpqa_diamond/test.jsonl"
+train_prompt_path="${proj_path}/prompts/multichoice.txt"
+test_prompt_path="${proj_path}/prompts/multichoice.txt"
 
-model="/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-num_instances=6
+
+# model="/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+model="deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+# num_instances=6
+num_instances=2
 sae_release=andreuka18/deepseek-r1-distill-llama-8b-lmsys-openthoughts
 sae_id=blocks.19.hook_resid_post
 save_dir="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B"

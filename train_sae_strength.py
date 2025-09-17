@@ -69,7 +69,8 @@ class TrainingConfig:
     test_data_path: str
     train_prompt_path: str
     test_prompt_path: str
-    batch_size: int = 1
+    train_batch_size: int = 1
+    test_batch_size: int = 1
     
     # 模型相关
     model: str = "meta-llama/Llama-2-7b-hf"
@@ -127,17 +128,22 @@ class DataProcessor:
         train_data = list(load_jsonl(self.config.train_data_path))
         for data in train_data:
             data['problem'] = data['problem'] + '\n' + train_prompt
-            
-        test_data = list(load_jsonl(self.config.test_data_path))
-        for data in test_data:
-            data['problem'] = data['problem'] + '\n' + test_prompt
+        
+        test_data_path_list = self.config.test_data_path.split(',')
+        all_test_data = []
+        for test_data_path in test_data_path_list:
+            test_data = list(load_jsonl(test_data_path))
+            for data in test_data:
+                data['problem'] = data['problem'] + '\n' + test_prompt
+                data['data_name'] = test_data_path.split('/')[-2]
+            all_test_data.extend(test_data)
         
         # 创建Dataset和DataLoader
         train_dataset = Dataset.from_list(train_data)
-        test_dataset = Dataset.from_list(test_data)
+        test_dataset = Dataset.from_list(all_test_data)
         
-        train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=self.config.batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=self.config.train_batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=self.config.test_batch_size, shuffle=False)
         
         return train_loader, test_loader
 
@@ -227,7 +233,8 @@ class MetricsLogger:
         return {
             "model": self.config.model,
             "learning_rate": self.config.lr,
-            "batch_size": self.config.batch_size,
+            "train_batch_size": self.config.train_batch_size,
+            "test_batch_size": self.config.test_batch_size,
             "num_epochs": self.config.num_epochs,
             "max_input_len": self.config.max_input_len,
             "max_output_len": self.config.max_output_len,
@@ -703,6 +710,9 @@ class StrengthTrainer:
         correct_num = 0
         val_start_time = time.time()
         
+        # 按数据集分组统计
+        dataset_stats = {}  # {data_name: {'correct': int, 'total': int}}
+        
         # 创建保存目录
         # os.makedirs(self.config.save_dir, exist_ok=True)
         eval_dir = os.path.join(self.config.save_dir, "validation_results")
@@ -716,6 +726,7 @@ class StrengthTrainer:
                     idxs = batch['idx'].tolist()
                     prompts = batch['problem']
                     answers = batch['answer']
+                    data_names = batch['data_name']  # 获取data_name字段
                     
                     hidden_states = self.vllm_sampler.get_last_token_hidden_state(prompts)
                     hidden_states = hidden_states.to(self.model_manager.predictor_device)
@@ -733,13 +744,23 @@ class StrengthTrainer:
                     rewards = rewards.to("cpu")
                     correct_num += (rewards > 0).sum().item()
                     
+                    # 按数据集分组统计准确率
+                    for i, (data_name, reward) in enumerate(zip(data_names, rewards)):
+                        if data_name not in dataset_stats:
+                            dataset_stats[data_name] = {'correct': 0, 'total': 0}
+                        
+                        dataset_stats[data_name]['total'] += 1
+                        if reward > 0:
+                            dataset_stats[data_name]['correct'] += 1
+                    
                     # 保存每个样本的结果到jsonl文件
-                    for (idx, problem, answer, response) in zip(idxs, prompts, answers, responses):
+                    for (idx, problem, answer, response, data_name) in zip(idxs, prompts, answers, responses, data_names):
                         result = {
                             "problem": problem,
                             "answer": answer,
                             "idx": idx,
-                            "model_response": response
+                            "model_response": response,
+                            "data_name": data_name
                         }
                         f.write(json.dumps(result, ensure_ascii=False) + "\n")
                     
@@ -748,21 +769,45 @@ class StrengthTrainer:
                     force_cleanup()
         
         val_duration = time.time() - val_start_time
-        accuracy = correct_num / len(self.test_loader.dataset) * 100
-        # Save metrics to json file
-        with open(metrics_file, 'w', encoding='utf-8') as f:
-            json.dump({
+        overall_accuracy = correct_num / len(self.test_loader.dataset) * 100
+        
+        # 计算每个数据集的准确率
+        dataset_accuracies = {}
+        for data_name, stats in dataset_stats.items():
+            accuracy = stats['correct'] / stats['total'] * 100 if stats['total'] > 0 else 0
+            dataset_accuracies[data_name] = {
                 'accuracy': accuracy,
-                'duration': val_duration
-            }, f, ensure_ascii=False, indent=4)
+            }
+        
+        # 保存详细指标到json文件
+        metrics = {
+            'overall_accuracy': overall_accuracy,
+            'duration': val_duration,
+            'dataset_accuracies': dataset_accuracies,
+            'total_samples': len(self.test_loader.dataset)
+        }
+        
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=4)
+        
+        # 打印详细结果
         print(f"验证指标已保存到: {metrics_file}")
         print(f"验证结果已保存到: {eval_file}")
+        print(f"总体准确率: {overall_accuracy:.2f}%")
+        print("各数据集准确率:")
+        for data_name, stats in dataset_accuracies.items():
+            print(f"  {data_name}: {stats['accuracy']:.2f}% ({stats['correct']}/{stats['total']})")
         
-        
-        return {
-            'accuracy': accuracy,
+        # 返回包含各数据集准确率的结果
+        result = {
+            'accuracy': overall_accuracy,
             'duration': val_duration
         }
+        # 添加各数据集的准确率到返回结果中
+        for data_name, stats in dataset_accuracies.items():
+            result[f'accuracy_{data_name}'] = stats['accuracy']
+        
+        return result
     
     def save_model(self, step: int):
         """保存模型"""
@@ -811,7 +856,20 @@ class StrengthTrainer:
                     val_metrics = self.validate(global_step)
                     val_metrics['epoch'] = epoch + 1
                     self.logger.log_validation_metrics(val_metrics, global_step)
-                    print(f"Epoch {epoch+1}, Validation accuracy: {val_metrics['accuracy']:.1f}%, Duration: {val_metrics['duration']:.2f}s")
+                    
+                    # 打印总体准确率
+                    print(f"Epoch {epoch+1}, Overall validation accuracy: {val_metrics['accuracy']:.1f}%, Duration: {val_metrics['duration']:.2f}s")
+                    
+                    # 打印各数据集的准确率
+                    dataset_accuracies = []
+                    for key, value in val_metrics.items():
+                        if key.startswith('accuracy_'):
+                            dataset_name = key.replace('accuracy_', '')
+                            dataset_accuracies.append(f"{dataset_name}: {value:.1f}%")
+                    
+                    if dataset_accuracies:
+                        print(f"Dataset accuracies: {', '.join(dataset_accuracies)}")
+                    
                     # 验证后清理显存
                     force_cleanup()
                     print(f"[MEMORY] 验证后: {get_memory_info(self.model_manager.predictor_device)}")
@@ -855,7 +913,8 @@ def create_config_from_args(args) -> TrainingConfig:
         test_data_path=args.test_data_path,
         train_prompt_path=args.train_prompt_path,
         test_prompt_path=args.test_prompt_path,
-        batch_size=args.batch_size,
+        train_batch_size=args.train_batch_size,
+        test_batch_size=args.test_batch_size,
         
         # 模型相关
         model=args.model,
@@ -912,7 +971,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_data_path", type=str, default=None)
     parser.add_argument("--test_data_path", type=str, default=None)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--test_batch_size", type=int, default=1)
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
     parser.add_argument('--tensor_parallel_size', type=int, default=1)
     parser.add_argument("--gpu_util", type=str, default="0.8")
