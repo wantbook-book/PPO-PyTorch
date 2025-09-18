@@ -40,7 +40,8 @@ save_dir="./checkpoints/strength_predictor_DeepSeek-R1-Distill-Llama-8B"
 save_interval=50
 eval_interval=10
 num_epochs=2
-batch_size=4
+train_batch_size=4
+test_batch_size=500
 feature_idxs=13023,19510,21893,25591,33275,43427,50670,51021,54249,61353
 # max_activations=20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0,20.0
 max_activations=10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0
@@ -54,7 +55,7 @@ python train_sae_strength.py \
     --test_data_path $test_data_path \
     --train_prompt_path $train_prompt_path \
     --test_prompt_path $test_prompt_path \
-    --batch_size $batch_size \
+    --train_batch_size $train_batch_size \
     --model $model \
     --tensor_parallel_size $tensor_parallel_size \
     --gpu_util $gpu_util \
@@ -82,4 +83,5 @@ python train_sae_strength.py \
     --logprobs $logprobs \
     --eval_interval $eval_interval \
     --num_instances $num_instances \
-    --intensity_std $intensity_std
+    --intensity_std $intensity_std \
+    --test_batch_size $test_batch_size
