@@ -462,7 +462,7 @@ class StrengthTrainer:
         # (N, n_sampler_per_prompt, seq_len)
         # (N, n_sampler_per_prompt, 1)
         # 使用更小的临时tensor以节省内存
-        kl_penalty_tensor = torch.zeros_like(sequences.to('cpu'))
+        kl_penalty_tensor = torch.zeros_like(sequences.to('cpu'))[-action_masks.shape[1]:]
         token_level_rewards = compute_reward(
             rewards, self.config.kl_coef, kl_penalty_tensor,
             action_mask=action_masks, reward_clip_range=self.config.reward_clip_range,
@@ -495,12 +495,12 @@ class StrengthTrainer:
         print(f"[TIMING] compute_batch_metrics总用时: {total_metrics_time:.4f}s")
         
         return {
-            'rewards': rewards,
+            # 'rewards': rewards,
             # 'kl_penalty': kl_penalty,
             # 'batch_kl_penalty': batch_kl_penalty,
             # 'sequence_entropies': sequence_entropies,
             # 'avg_sequence_entropy': avg_sequence_entropy,
-            'token_level_rewards': token_level_rewards,
+            # 'token_level_rewards': token_level_rewards,
             'advantages': advantages,
             'batch_rewards': batch_rewards_value,
             'avg_response_length': avg_response_length,
@@ -614,7 +614,8 @@ class StrengthTrainer:
         
         # 计算损失
         loss_start_time = time.time()
-        advantages = metrics['advantages'][:, :self.feature_num]
+        # advantages = metrics['advantages'][:, :self.feature_num]
+        advantages = metrics['advantages'][:, 0]
         advantages = advantages.to(self.model_manager.predictor_device)
         
         # 避免重复计算，直接使用之前计算的predicted_strengths
